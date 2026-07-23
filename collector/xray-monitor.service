@@ -1,0 +1,17 @@
+[Unit]
+Description=Xray personal traffic monitor
+After=network.target xray.service
+Wants=xray.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/xray-monitor.env
+ExecStart=/opt/xray-monitor/xray_monitor.py
+Restart=always
+RestartSec=3
+User=root
+Group=root
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

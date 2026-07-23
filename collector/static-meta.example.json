@@ -1,0 +1,12 @@
+{
+  "legacy-vless.json": [
+    "家庭设备",
+    "proxy.example.com:443",
+    "direct"
+  ],
+  "legacy-vmess-ws.json": [
+    "CDN 入口",
+    "cdn.example.com",
+    "cdn"
+  ]
+}

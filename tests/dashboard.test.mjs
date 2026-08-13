@@ -62,3 +62,16 @@ test("keeps multi-client UUID discovery and rendering enabled", async () => {
   assert.match(dashboard, /devices\.map\(\(device\)/);
   assert.match(dashboard, /展示此链接配置中的全部设备 UUID/);
 });
+
+test("uses a configurable rolling server traffic period", async () => {
+  const [collector, dashboard] = await Promise.all([
+    readFile(new URL("collector/xray_monitor.py", root), "utf8"),
+    readFile(new URL("app/Dashboard.tsx", root), "utf8"),
+  ]);
+
+  assert.match(collector, /XRAY_MONITOR_RESET_ANCHOR/);
+  assert.match(collector, /XRAY_MONITOR_PERIOD_DAYS/);
+  assert.match(collector, /server_period_bounds/);
+  assert.match(dashboard, /服务器本周期剩余/);
+  assert.doesNotMatch(dashboard, /服务器本月剩余/);
+});

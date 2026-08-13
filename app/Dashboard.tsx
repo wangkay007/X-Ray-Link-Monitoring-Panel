@@ -575,9 +575,9 @@ export default function Dashboard() {
           </div>
           <span>采集服务启动以来</span>
           {bandwidth ? <div className="server-quota">
-            <div><span>服务器本月剩余</span><strong>{formatBytes(bandwidth.remainingBytes)}</strong></div>
+            <div><span>服务器本周期剩余</span><strong>{formatBytes(bandwidth.remainingBytes)}</strong></div>
             <span className="quota-track"><i style={{ width: `${bandwidthPercent}%` }} /></span>
-            <small>本机已统计 {formatBytes(bandwidth.usedBytes)} / 500 GB · {formatTime(bandwidth.nextReset)} 重置</small>
+            <small>本机已统计 {formatBytes(bandwidth.usedBytes)} / {formatBytes(bandwidth.limitBytes)} · {bandwidth.periodDays} 天周期 · {formatTime(bandwidth.nextReset)} 重置</small>
           </div> : null}
         </div>
         <div className="stats">

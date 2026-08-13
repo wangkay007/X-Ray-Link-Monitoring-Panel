@@ -60,6 +60,7 @@ export type MonitorSnapshot = {
     periodStart: number;
     nextReset: number;
     measuredSince: number;
+    periodDays: number;
     source: "local";
   };
   links: LinkUsage[];

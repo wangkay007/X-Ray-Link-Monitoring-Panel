@@ -43,7 +43,16 @@ STATIC_META_PATH = os.environ.get("XRAY_MONITOR_STATIC_META", "/etc/xray-monitor
 SERVER_HOST = os.environ.get("XRAY_MONITOR_HOST", "127.0.0.1")
 NET_DEVICE = os.environ.get("XRAY_MONITOR_INTERFACE", "eth0")
 SERVER_LIMIT_BYTES = int(os.environ.get("XRAY_MONITOR_MONTHLY_BYTES", str(500 * 1024 * 1024 * 1024)))
+SERVER_PERIOD_DAYS = int(os.environ.get("XRAY_MONITOR_PERIOD_DAYS", "30"))
+SERVER_RESET_ANCHOR = os.environ.get("XRAY_MONITOR_RESET_ANCHOR", "1970-01-01")
 BACKUP_DIR = os.environ.get("XRAY_MONITOR_BACKUPS", "/var/lib/xray-monitor/backups")
+
+if SERVER_PERIOD_DAYS < 1:
+    raise ValueError("XRAY_MONITOR_PERIOD_DAYS must be at least 1")
+try:
+    SERVER_RESET_ANCHOR_DATE = datetime.datetime.strptime(SERVER_RESET_ANCHOR, "%Y-%m-%d")
+except ValueError:
+    raise ValueError("XRAY_MONITOR_RESET_ANCHOR must use YYYY-MM-DD")
 
 def load_static_meta():
     try:
@@ -130,6 +139,7 @@ def init_db():
       updated_at INTEGER NOT NULL DEFAULT 0
     );
     """)
+    migrate_server_traffic(conn)
     conn.commit()
     conn.close()
 
@@ -287,12 +297,49 @@ def read_network_counters():
     return None
 
 
+def server_period_bounds(stamp):
+    current = datetime.datetime.fromtimestamp(stamp)
+    elapsed_days = (current.date() - SERVER_RESET_ANCHOR_DATE.date()).days
+    period_index = elapsed_days // SERVER_PERIOD_DAYS
+    start = SERVER_RESET_ANCHOR_DATE + datetime.timedelta(days=period_index * SERVER_PERIOD_DAYS)
+    next_start = start + datetime.timedelta(days=SERVER_PERIOD_DAYS)
+    return int(time.mktime(start.timetuple())), int(time.mktime(next_start.timetuple()))
+
+
+def server_period_key(stamp):
+    period_start, unused_next = server_period_bounds(stamp)
+    return time.strftime("%Y-%m-%d", time.localtime(period_start))
+
+
+def migrate_server_traffic(conn):
+    """Fold legacy calendar-month counters into the active billing period."""
+    stamp = now()
+    period_start, next_reset = server_period_bounds(stamp)
+    period_key = server_period_key(stamp)
+    if conn.execute("SELECT 1 FROM server_traffic WHERE month=?", (period_key,)).fetchone():
+        return
+    legacy = list(conn.execute(
+        "SELECT * FROM server_traffic WHERE length(month)=7 AND updated_at>=? AND measured_since<? ORDER BY updated_at",
+        (period_start, next_reset),
+    ))
+    if not legacy:
+        return
+    latest = legacy[-1]
+    conn.execute(
+        "INSERT INTO server_traffic(month,last_rx,last_tx,total_rx,total_tx,measured_since,updated_at) VALUES(?,?,?,?,?,?,?)",
+        (period_key, latest["last_rx"], latest["last_tx"],
+         sum(int(row["total_rx"]) for row in legacy), sum(int(row["total_tx"]) for row in legacy),
+         min(int(row["measured_since"]) for row in legacy), max(int(row["updated_at"]) for row in legacy)),
+    )
+    conn.executemany("DELETE FROM server_traffic WHERE month=?", [(row["month"],) for row in legacy])
+
+
 def update_server_traffic():
     current = read_network_counters()
     if current is None:
         return
     stamp = now()
-    month = time.strftime("%Y-%m", time.localtime(stamp))
+    month = server_period_key(stamp)
     conn = db()
     row = conn.execute("SELECT * FROM server_traffic WHERE month=?", (month,)).fetchone()
     if row:
@@ -303,7 +350,7 @@ def update_server_traffic():
     else:
         conn.execute("INSERT INTO server_traffic(month,last_rx,last_tx,total_rx,total_tx,measured_since,updated_at) VALUES(?,?,?,?,?,?,?)",
                      (month, current[0], current[1], 0, 0, stamp, stamp))
-    conn.execute("DELETE FROM server_traffic WHERE month < ?", ((datetime.datetime.now() - datetime.timedelta(days=370)).strftime("%Y-%m"),))
+    conn.execute("DELETE FROM server_traffic WHERE updated_at < ?", (stamp - 370 * 86400,))
     conn.commit()
     conn.close()
 
@@ -832,13 +879,6 @@ def stats_loop():
         time.sleep(30)
 
 
-def month_bounds(stamp):
-    current = datetime.datetime.fromtimestamp(stamp)
-    start = datetime.datetime(current.year, current.month, 1)
-    next_start = datetime.datetime(current.year + 1, 1, 1) if current.month == 12 else datetime.datetime(current.year, current.month + 1, 1)
-    return int(time.mktime(start.timetuple())), int(time.mktime(next_start.timetuple()))
-
-
 def snapshot():
     links_meta = discover_links()
     conn = db()
@@ -890,20 +930,20 @@ def snapshot():
     buckets = {}
     for row in conn.execute("SELECT bucket,SUM(up_bytes) AS up_bytes,SUM(down_bytes) AS down_bytes FROM samples WHERE bucket>=? GROUP BY bucket ORDER BY bucket", (stamp - 86400,)):
         buckets[str(row["bucket"])] = {"uplink": int(row["up_bytes"]), "downlink": int(row["down_bytes"])}
-    month = time.strftime("%Y-%m", time.localtime(stamp))
+    month = server_period_key(stamp)
     traffic = conn.execute("SELECT * FROM server_traffic WHERE month=?", (month,)).fetchone()
     conn.close()
     used = int(traffic["total_rx"] + traffic["total_tx"]) if traffic else 0
-    period_start, next_reset = month_bounds(stamp)
+    period_start, next_reset = server_period_bounds(stamp)
     return {
         "server": {"name": "狗云", "host": SERVER_HOST, "online": bool(counter_rows), "xray": "26.3.27"},
         "generatedAt": stamp,
         "totals": {"uplink": total_up, "downlink": total_down, "traffic": total_up + total_down},
         "bandwidth": {"limitBytes": SERVER_LIMIT_BYTES, "usedBytes": used, "remainingBytes": max(0, SERVER_LIMIT_BYTES - used),
                       "periodStart": period_start, "nextReset": next_reset, "measuredSince": int(traffic["measured_since"]) if traffic else stamp,
-                      "source": "local"},
+                      "periodDays": SERVER_PERIOD_DAYS, "source": "local"},
         "links": links, "recentIps": recent, "series": buckets,
-        "notice": "链接流量由 Xray 精确统计；来源 IP 来自连接日志。Xray 不会上报设备型号，可为 IP 添加设备备注并按备注批量封禁。服务器 500 GB 为本机网卡估算，不等同于狗云账单口径。",
+        "notice": "链接流量由 Xray 精确统计；来源 IP 来自连接日志。Xray 不会上报设备型号，可为 IP 添加设备备注并按备注批量封禁。服务器流量按 30 天账单周期统计，本机网卡口径可能与云厂商账单略有差异。",
     }
 
 

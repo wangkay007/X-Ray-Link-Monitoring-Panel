@@ -46,6 +46,30 @@ SERVER_LIMIT_BYTES = int(os.environ.get("XRAY_MONITOR_MONTHLY_BYTES", str(500 * 
 SERVER_PERIOD_DAYS = int(os.environ.get("XRAY_MONITOR_PERIOD_DAYS", "30"))
 SERVER_RESET_ANCHOR = os.environ.get("XRAY_MONITOR_RESET_ANCHOR", "1970-01-01")
 BACKUP_DIR = os.environ.get("XRAY_MONITOR_BACKUPS", "/var/lib/xray-monitor/backups")
+XRAY_ERROR_LOG = os.environ.get("XRAY_ERROR_LOG", "/var/log/xray/error.log")
+
+PROTOCOLS = {
+    "vless-reality": {"label": "VLESS Reality", "alias": "reality", "kind": "reality"},
+    "vmess-tcp": {"label": "VMess TCP", "alias": "tcp", "kind": "direct"},
+    "vmess-mkcp": {"label": "VMess mKCP", "alias": "kcp", "kind": "direct"},
+    "vmess-ws-tls": {"label": "VMess WS TLS", "alias": "ws", "kind": "tls"},
+    "vmess-grpc-tls": {"label": "VMess gRPC TLS", "alias": "grpc", "kind": "tls"},
+    "vless-ws-tls": {"label": "VLESS WS TLS", "alias": "vws", "kind": "tls"},
+    "vless-grpc-tls": {"label": "VLESS gRPC TLS", "alias": "vgrpc", "kind": "tls"},
+    "vless-xhttp-tls": {"label": "VLESS XHTTP TLS", "alias": "xhttp", "kind": "tls"},
+    "trojan-ws-tls": {"label": "Trojan WS TLS", "alias": "tws", "kind": "tls"},
+    "trojan-grpc-tls": {"label": "Trojan gRPC TLS", "alias": "tgrpc", "kind": "tls"},
+    "shadowsocks": {"label": "Shadowsocks", "alias": "ss", "kind": "shadowsocks"},
+    "socks": {"label": "Socks", "alias": "socks", "kind": "socks"},
+}
+
+SERVICE_ACTIONS = {
+    "start": ["start"], "stop": ["stop"], "restart": ["restart"],
+    "test": ["test"], "fix-all": ["fix-all"],
+    "fix-config": ["fix-config.json"], "fix-caddy": ["fix-caddyfile"],
+    "update-core": ["update", "core"], "update-script": ["update", "sh"],
+    "update-data": ["update", "dat"], "update-caddy": ["update", "caddy"],
+}
 
 if SERVER_PERIOD_DAYS < 1:
     raise ValueError("XRAY_MONITOR_PERIOD_DAYS must be at least 1")
@@ -138,6 +162,12 @@ def init_db():
       total_tx INTEGER NOT NULL DEFAULT 0, measured_since INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS command_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL,
+      target TEXT NOT NULL DEFAULT '', success INTEGER NOT NULL DEFAULT 0,
+      output TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS command_audit_created_idx ON command_audit(created_at DESC);
     """)
     migrate_server_traffic(conn)
     conn.commit()
@@ -197,6 +227,22 @@ def device_code(client_id):
     return "DEV-" + client_id.replace("-", "")[:8].upper()
 
 
+def protocol_id(protocol, network, security):
+    if protocol == "vless" and security == "reality": return "vless-reality"
+    if protocol == "vmess" and network == "tcp": return "vmess-tcp"
+    if protocol == "vmess" and network == "kcp": return "vmess-mkcp"
+    if protocol == "vmess" and network == "ws": return "vmess-ws-tls"
+    if protocol == "vmess" and network == "grpc": return "vmess-grpc-tls"
+    if protocol == "vless" and network == "ws": return "vless-ws-tls"
+    if protocol == "vless" and network == "grpc": return "vless-grpc-tls"
+    if protocol == "vless" and network in ("xhttp", "splithttp"): return "vless-xhttp-tls"
+    if protocol == "trojan" and network == "ws": return "trojan-ws-tls"
+    if protocol == "trojan" and network == "grpc": return "trojan-grpc-tls"
+    if protocol == "shadowsocks": return "shadowsocks"
+    if protocol == "socks": return "socks"
+    return None
+
+
 def discover_links():
     conn = db()
     meta_rows = {row["tag"]: row for row in conn.execute("SELECT * FROM link_meta")}
@@ -211,16 +257,15 @@ def discover_links():
         for inbound in payload.get("inbounds", []):
             tag = inbound.get("tag")
             protocol = inbound.get("protocol", "unknown")
-            if not tag or protocol not in ("vless", "vmess"):
+            if not tag:
                 continue
             stream = inbound.get("streamSettings", {})
             network = stream.get("network", "tcp")
             security = stream.get("security")
-            protocol_label = protocol.upper()
-            if security == "reality":
-                protocol_label += " Reality"
-            elif network == "ws":
-                protocol_label += " WS TLS"
+            protocol_key = protocol_id(protocol, network, security)
+            if not protocol_key:
+                continue
+            protocol_label = PROTOCOLS[protocol_key]["label"]
             port = int(inbound.get("port", 0) or 0)
             static = STATIC_META.get(tag)
             metadata = meta_rows.get(tag)
@@ -229,9 +274,13 @@ def discover_links():
             transport = "direct"
             if static:
                 endpoint, transport = static[1], static[2]
-            elif network == "ws":
+            elif PROTOCOLS[protocol_key]["kind"] == "tls":
                 headers = stream.get("wsSettings", {}).get("headers", {})
-                endpoint = headers.get("Host") or headers.get("host") or endpoint
+                grpc = stream.get("grpcSettings", {})
+                xhttp = stream.get("xhttpSettings", stream.get("splithttpSettings", {}))
+                xhttp_host = xhttp.get("host")
+                if isinstance(xhttp_host, list): xhttp_host = xhttp_host[0] if xhttp_host else None
+                endpoint = headers.get("Host") or headers.get("host") or stream.get("grpc_host") or xhttp_host or endpoint
                 transport = "cdn"
             devices = []
             for client in inbound.get("settings", {}).get("clients", []):
@@ -246,12 +295,28 @@ def discover_links():
                     "disabled": bool(control.get("disabled")),
                     "lastError": control.get("last_error"),
                 })
+            ws = stream.get("wsSettings", {})
+            grpc = stream.get("grpcSettings", {})
+            xhttp = stream.get("xhttpSettings", stream.get("splithttpSettings", {}))
+            reality = stream.get("realitySettings", {})
+            host = ws.get("headers", {}).get("Host") or ws.get("headers", {}).get("host") or stream.get("grpc_host") or xhttp.get("host") or ""
+            if isinstance(host, list): host = host[0] if host else ""
+            path_value = ws.get("path") or grpc.get("serviceName") or xhttp.get("path") or ""
+            settings = inbound.get("settings", {})
+            accounts = settings.get("accounts", [])
             result[tag] = {
                 "id": tag, "name": name, "protocol": protocol_label,
                 "endpoint": endpoint, "transport": transport, "port": port,
-                "managed": bool(metadata and metadata["managed"]),
+                "managed": True,
                 "shareUri": metadata.get("share_uri") if metadata else None,
                 "devices": devices,
+                "config": {
+                    "protocolId": protocol_key, "host": host, "path": path_value,
+                    "sni": (reality.get("serverNames") or [""])[0],
+                    "headerType": stream.get("tcpSettings", {}).get("header", {}).get("type") or stream.get("kcpSettings", {}).get("header", {}).get("type") or "none",
+                    "method": settings.get("method") or "",
+                    "username": accounts[0].get("user", "") if accounts else "",
+                },
                 "configPath": path,
             }
     return result
@@ -701,27 +766,129 @@ def record_access(line):
     conn.close()
 
 
-def run_xray(args):
-    return subprocess.check_output([XRAY] + args, stderr=subprocess.STDOUT).decode("utf-8", "replace").strip()
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
+PATH_RE = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{1,180}$")
+SS_METHODS = ("aes-128-gcm", "aes-256-gcm", "chacha20-poly1305", "xchacha20-poly1305")
 
 
-def validate_name_port_sni(payload, current_tag=None):
-    name = (payload.get("name") or "").strip()
-    sni = (payload.get("sni") or "www.cloudflare.com").strip().lower()
+def clean_output(value):
+    return ANSI_RE.sub("", value or "").strip()
+
+
+def audit_command(action, target, success, output):
     try:
-        port = int(payload.get("port"))
+        conn = db()
+        conn.execute("INSERT INTO command_audit(action,target,success,output,created_at) VALUES(?,?,?,?,?)",
+                     (action, target or "", 1 if success else 0, clean_output(output)[-2000:], now()))
+        conn.commit()
+        conn.close()
     except Exception:
-        raise ValueError("端口格式不正确")
+        pass
+
+
+def run_process(args, timeout=180):
+    process = subprocess.Popen(list(args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    deadline = time.time() + timeout
+    while process.poll() is None:
+        if time.time() >= deadline:
+            process.kill()
+            output = process.communicate()[0]
+            raise RuntimeError("命令执行超时\n" + clean_output(output.decode("utf-8", "replace"))[-400:])
+        time.sleep(0.1)
+    output = process.communicate()[0]
+    value = clean_output(output.decode("utf-8", "replace"))
+    if process.returncode != 0: raise RuntimeError(value[-800:] or "命令执行失败")
+    return value
+
+
+def run_xray(args, timeout=180, audit_action=None, target=""):
+    try:
+        value = run_process([XRAY] + list(args), timeout)
+        if audit_action: audit_command(audit_action, target, True, value)
+        return value
+    except Exception as error:
+        value = clean_output(text_type(error))
+        if audit_action: audit_command(audit_action, target, False, value)
+        raise RuntimeError(value[-800:] or "Xray 命令执行失败")
+
+
+def validate_name(value):
+    name = (value or "").strip()
     if not name or len(name) > 32:
         raise ValueError("名称需为 1 到 32 个字符")
-    if port < 1024 or port > 65535:
-        raise ValueError("端口需在 1024 到 65535 之间")
-    if not DOMAIN_RE.match(sni) or ".." in sni:
-        raise ValueError("伪装域名格式不正确")
+    return name
+
+
+def validate_port(value, current_tag=None):
+    try: port = int(value)
+    except Exception: raise ValueError("端口格式不正确")
+    if port < 1024 or port > 65535: raise ValueError("端口需在 1024 到 65535 之间")
     for tag, link in discover_links().items():
         if tag != current_tag and link["port"] == port:
             raise ValueError("该端口已被其他 Xray 链接使用")
-    return name, port, sni
+    return port
+
+
+def validate_domain(value, label="域名"):
+    domain = (value or "").strip().lower()
+    if not domain or not DOMAIN_RE.match(domain) or ".." in domain or domain.startswith(".") or domain.endswith("."):
+        raise ValueError(label + "格式不正确")
+    return domain
+
+
+def validate_path(value):
+    path = (value or "").strip()
+    if not PATH_RE.match(path): raise ValueError("路径需以 / 开头，且不能包含空格")
+    return path
+
+
+def validate_secret(value, label="密码"):
+    secret = (value or "").strip()
+    if len(secret) < 8 or len(secret) > 128 or any(ord(char) < 33 for char in secret):
+        raise ValueError(label + "需为 8 到 128 个非空白字符")
+    return secret
+
+
+def generate_uuid():
+    value = run_xray(["uuid"]).splitlines()[-1].strip()
+    if not UUID_RE.match(value): raise RuntimeError("无法生成 UUID")
+    return value
+
+
+def manager_args(payload):
+    protocol_key = (payload.get("protocolId") or "vless-reality").strip()
+    if protocol_key not in PROTOCOLS: raise ValueError("不支持该协议")
+    definition = PROTOCOLS[protocol_key]
+    kind = definition["kind"]
+    args = [definition["alias"]]
+    if kind == "reality":
+        port = validate_port(payload.get("port"))
+        client_id = (payload.get("uuid") or "").strip() or generate_uuid()
+        if not UUID_RE.match(client_id): raise ValueError("UUID 格式不正确")
+        args += [str(port), client_id, validate_domain(payload.get("sni") or "www.cloudflare.com", "Reality SNI")]
+    elif kind == "direct":
+        port = validate_port(payload.get("port"))
+        client_id = (payload.get("uuid") or "").strip() or generate_uuid()
+        if not UUID_RE.match(client_id): raise ValueError("UUID 格式不正确")
+        header = (payload.get("headerType") or "none").strip().lower()
+        if header not in ("none", "http", "srtp", "utp", "wechat-video", "dtls", "wireguard"):
+            raise ValueError("伪装类型不受支持")
+        args += [str(port), client_id, header]
+    elif kind == "tls":
+        host = validate_domain(payload.get("host"), "TLS 域名")
+        client_id = (payload.get("uuid") or "").strip() or generate_uuid()
+        if not UUID_RE.match(client_id): raise ValueError("UUID 或 Trojan 密码格式不正确")
+        args += [host, client_id, validate_path(payload.get("path") or ("/" + client_id.replace("-", "")[:16]))]
+    elif kind == "shadowsocks":
+        method = (payload.get("method") or "aes-256-gcm").strip().lower()
+        if method not in SS_METHODS: raise ValueError("Shadowsocks 加密方式不受支持")
+        args += [str(validate_port(payload.get("port"))), validate_secret(payload.get("password") or generate_uuid()), method]
+    elif kind == "socks":
+        username = (payload.get("username") or "").strip()
+        if not re.match(r"^[A-Za-z0-9._-]{3,32}$", username): raise ValueError("Socks 用户名格式不正确")
+        args += [str(validate_port(payload.get("port"))), username, validate_secret(payload.get("password"))]
+    return protocol_key, args
 
 
 def test_all_configs():
@@ -741,109 +908,177 @@ def atomic_write_json(path, payload):
             os.unlink(temporary)
 
 
-def share_uri(client_id, port, sni, public_key, short_id, name):
-    query = "encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp" % (
-        url_quote(sni.encode("utf-8")), url_quote(public_key.encode("utf-8")), short_id)
-    return "vless://%s@%s:%s?%s#%s" % (client_id, SERVER_HOST, port, query, url_quote(name.encode("utf-8")))
+def xray_files():
+    return set(os.path.basename(path) for path in glob.glob(os.path.join(XRAY_CONFIG_DIR, "*.json")) if "-link.json" not in path)
+
+
+def extract_share_uri(tag):
+    output = run_xray(["url", tag], timeout=30)
+    matches = re.findall(r"(?:vmess|vless|trojan|ss|socks)://[^\s\x1b]+", output)
+    return matches[0] if matches else None
+
+
+def save_link_meta(tag, name, uri=None):
+    stamp = now()
+    conn = db()
+    conn.execute("INSERT OR REPLACE INTO link_meta(tag,name,managed,share_uri,created_at,updated_at) VALUES(?,?,1,?,COALESCE((SELECT created_at FROM link_meta WHERE tag=?),?),?)",
+                 (tag, name, uri, tag, stamp, stamp))
+    conn.commit()
+    conn.close()
 
 
 def create_link(payload):
-    name, port, sni = validate_name_port_sni(payload)
-    client_id = run_xray(["uuid"]).splitlines()[-1].strip()
-    keys = run_xray(["x25519"])
-    private_match = re.search(r"PrivateKey:\s*(\S+)", keys)
-    public_match = re.search(r"Password \(PublicKey\):\s*(\S+)", keys)
-    if not private_match or not public_match:
-        raise RuntimeError("无法生成 Reality 密钥")
-    private_key, public_key = private_match.group(1), public_match.group(1)
-    short_id = binascii.hexlify(os.urandom(8)).decode("ascii")
-    tag = "MONITOR-VLESS-%s.json" % hashlib.sha1((name + str(port) + str(now())).encode("utf-8")).hexdigest()[:12]
-    path = os.path.join(XRAY_CONFIG_DIR, tag)
-    config = {"inbounds": [{
-        "listen": "0.0.0.0", "port": port, "protocol": "vless", "tag": tag,
-        "settings": {"clients": [{"id": client_id, "email": device_email(client_id), "flow": "xtls-rprx-vision"}], "decryption": "none"},
-        "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": True},
-        "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {
-            "dest": sni + ":443", "serverNames": [sni], "privateKey": private_key,
-            "publicKey": public_key, "shortIds": [short_id]
-        }}
-    }]}
-    uri = share_uri(client_id, port, sni, public_key, short_id, name)
-    atomic_write_json(path, config)
-    try:
-        test_all_configs()
-        run_xray(["api", "adi", "--server=" + API_SERVER, path])
-    except Exception:
-        if os.path.exists(path):
-            os.unlink(path)
-        raise
-    conn = db()
-    conn.execute("INSERT INTO link_meta(tag,name,managed,share_uri,created_at,updated_at) VALUES(?,?,1,?,?,?)", (tag, name, uri, now(), now()))
-    conn.commit()
-    conn.close()
+    name = validate_name(payload.get("name"))
+    protocol_key, args = manager_args(payload)
+    before = xray_files()
+    run_xray(["add"] + args, audit_action="link.create", target=protocol_key)
+    created = sorted(xray_files() - before)
+    if len(created) != 1:
+        raise RuntimeError("配置已创建，但无法唯一识别新链接；请刷新后检查")
+    tag = created[0]
+    uri = extract_share_uri(tag)
+    save_link_meta(tag, name, uri)
     apply_block_rules()
     return uri
 
 
-def update_link(payload):
-    tag = payload.get("tag")
-    links = discover_links()
-    if tag not in links or not links[tag]["managed"]:
-        raise ValueError("仅支持编辑由后台创建的链接")
-    name, port, sni = validate_name_port_sni(payload, tag)
-    path = links[tag]["configPath"]
-    config = read_json(path)
-    inbound = config["inbounds"][0]
-    reality = inbound["streamSettings"]["realitySettings"]
-    client_id = inbound["settings"]["clients"][0]["id"]
-    public_key = reality.get("publicKey")
-    if not public_key:
-        output = run_xray(["x25519", "-i", reality["privateKey"]])
-        match = re.search(r"Password \(PublicKey\):\s*(\S+)", output)
-        public_key = match.group(1) if match else ""
-    short_id = (reality.get("shortIds") or [""])[0]
-    uri = share_uri(client_id, port, sni, public_key, short_id, name)
-    backup = os.path.join(BACKUP_DIR, "%s.%s" % (tag, now()))
-    shutil.copy2(path, backup)
-    inbound["port"] = port
-    reality["dest"] = sni + ":443"
-    reality["serverNames"] = [sni]
-    atomic_write_json(path, config)
-    try:
-        test_all_configs()
-        run_xray(["api", "rmi", "--server=" + API_SERVER, tag])
-        run_xray(["api", "adi", "--server=" + API_SERVER, path])
-    except Exception:
-        shutil.copy2(backup, path)
-        try:
-            run_xray(["api", "adi", "--server=" + API_SERVER, path])
-        except Exception:
-            pass
-        raise
+def migrate_tag(old_tag, new_tag):
+    if old_tag == new_tag: return
     conn = db()
-    conn.execute("UPDATE link_meta SET name=?,share_uri=?,updated_at=? WHERE tag=?", (name, uri, now(), tag))
+    for table in ("counters", "ip_usage", "samples", "quotas", "expirations", "uuid_controls"):
+        try: conn.execute("UPDATE OR IGNORE %s SET tag=? WHERE tag=?" % table, (new_tag, old_tag))
+        except sqlite3.Error: pass
+    conn.execute("UPDATE OR REPLACE link_meta SET tag=? WHERE tag=?", (new_tag, old_tag))
     conn.commit()
     conn.close()
+
+
+def changed_tag(old_tag, before):
+    after = xray_files()
+    if old_tag in after: return old_tag
+    created = sorted(after - before)
+    if len(created) != 1: raise RuntimeError("配置已修改，但无法识别新的配置文件名")
+    migrate_tag(old_tag, created[0])
+    return created[0]
+
+
+def run_link_change(tag, change_type, value, extra=None):
+    before = xray_files()
+    args = ["change", tag, change_type, text_type(value)]
+    if extra is not None: args.append(text_type(extra))
+    run_xray(args, audit_action="link.change." + change_type, target=tag)
+    return changed_tag(tag, before)
+
+
+def update_link(payload):
+    tag = (payload.get("tag") or "").strip()
+    links = discover_links()
+    if tag not in links: raise ValueError("找不到该 Xray 链接")
+    link = links[tag]
+    name = validate_name(payload.get("name"))
+    backup = os.path.join(BACKUP_DIR, "%s.before-edit.%s" % (tag, now()))
+    shutil.copy2(link["configPath"], backup)
+    config = link["config"]
+    kind = PROTOCOLS[config["protocolId"]]["kind"]
+    current = tag
+    if kind in ("direct", "reality", "shadowsocks", "socks") and payload.get("port") is not None:
+        port = validate_port(payload.get("port"), current)
+        if port != link["port"]: current = run_link_change(current, "port", port)
+    if kind == "tls" and payload.get("host") and payload.get("host").strip().lower() != config.get("host"):
+        current = run_link_change(current, "host", validate_domain(payload.get("host"), "TLS 域名"))
+    if kind == "tls" and payload.get("path") and payload.get("path").strip() != config.get("path"):
+        current = run_link_change(current, "path", validate_path(payload.get("path")))
+    if kind == "reality" and payload.get("sni") and payload.get("sni").strip().lower() != config.get("sni"):
+        current = run_link_change(current, "sni", validate_domain(payload.get("sni"), "Reality SNI"))
+    if kind == "direct" and payload.get("headerType") and payload.get("headerType") != config.get("headerType"):
+        current = run_link_change(current, "type", payload.get("headerType"))
+    if kind == "shadowsocks" and payload.get("method") and payload.get("method") != config.get("method"):
+        method = payload.get("method").strip().lower()
+        if method not in SS_METHODS: raise ValueError("Shadowsocks 加密方式不受支持")
+        current = run_link_change(current, "method", method)
+    credential = (payload.get("credential") or "").strip()
+    if credential:
+        if kind in ("direct", "reality", "tls"):
+            if not UUID_RE.match(credential): raise ValueError("UUID 格式不正确")
+            current = run_link_change(current, "uuid", credential)
+        elif kind in ("shadowsocks", "socks"):
+            current = run_link_change(current, "passwd", validate_secret(credential))
+    uri = extract_share_uri(current)
+    save_link_meta(current, name, uri)
     apply_block_rules()
     return uri
 
 
 def delete_link(payload):
-    tag = payload.get("tag")
+    tag = (payload.get("tag") or "").strip()
     links = discover_links()
-    if tag not in links or not links[tag]["managed"]:
-        raise ValueError("仅支持删除由后台创建的链接")
-    path = links[tag]["configPath"]
-    backup = os.path.join(BACKUP_DIR, "%s.deleted.%s" % (tag, now()))
-    run_xray(["api", "rmi", "--server=" + API_SERVER, tag])
-    shutil.move(path, backup)
+    if tag not in links: raise ValueError("找不到该 Xray 链接")
+    backup = os.path.join(BACKUP_DIR, "%s.before-delete.%s" % (tag, now()))
+    shutil.copy2(links[tag]["configPath"], backup)
+    try:
+        run_xray(["del", tag], audit_action="link.delete", target=tag)
+    except RuntimeError:
+        if os.path.exists(links[tag]["configPath"]): raise
+        audit_command("link.delete.confirmed", tag, True, "脚本已删除配置；忽略其非零退出码")
     conn = db()
-    conn.execute("DELETE FROM link_meta WHERE tag=?", (tag,))
-    conn.execute("DELETE FROM quotas WHERE tag=?", (tag,))
-    conn.execute("DELETE FROM expirations WHERE tag=?", (tag,))
-    conn.execute("DELETE FROM uuid_controls WHERE tag=?", (tag,))
+    for table in ("link_meta", "quotas", "expirations", "uuid_controls"):
+        conn.execute("DELETE FROM %s WHERE tag=?" % table, (tag,))
     conn.commit()
     conn.close()
+
+
+def service_status():
+    def active(name):
+        null = open(os.devnull, "w")
+        try: return subprocess.call(["systemctl", "is-active", "--quiet", name], stdout=null, stderr=null) == 0
+        finally: null.close()
+    try: version = run_xray(["version"], timeout=10).splitlines()[0]
+    except Exception: version = "Xray"
+    conn = db()
+    audit = list(conn.execute("SELECT action,target,success,output,created_at FROM command_audit ORDER BY id DESC LIMIT 12"))
+    conn.close()
+    return {"running": active("xray"), "caddyRunning": active("caddy"), "version": version,
+            "script": "233boy v1.33", "protocols": [dict({"id": key}, **value) for key, value in PROTOCOLS.items()],
+            "audit": audit}
+
+
+def run_service_action(payload):
+    action = (payload.get("action") or "").strip()
+    if action == "link-url":
+        tag = (payload.get("tag") or "").strip()
+        if tag not in discover_links(): raise ValueError("找不到该 Xray 链接")
+        uri = extract_share_uri(tag)
+        if not uri: raise RuntimeError("该配置没有可用的分享链接")
+        audit_command("link.url", tag, True, "已生成分享链接")
+        return {"output": uri, "shareUri": uri}
+    if action not in SERVICE_ACTIONS: raise ValueError("不允许执行该命令")
+    if action == "test":
+        test_all_configs()
+        output = "全部 Xray 配置测试通过"
+        audit_command("service.test", "xray", True, output)
+    elif action in ("start", "stop", "restart"):
+        try:
+            output = run_process(["systemctl", action, "xray"], 45)
+            audit_command("service." + action, "xray", True, output or "完成")
+        except Exception as error:
+            audit_command("service." + action, "xray", False, text_type(error))
+            raise RuntimeError("Xray 服务操作失败")
+    else:
+        output = run_xray(SERVICE_ACTIONS[action], timeout=300, audit_action="service." + action, target="xray")
+    return {"output": clean_output(output) or "命令执行完成"}
+
+
+def read_logs():
+    def tail(path, lines=160):
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, 2)
+                size = handle.tell()
+                handle.seek(max(0, size - 256 * 1024))
+                return handle.read().decode("utf-8", "replace").splitlines()[-lines:]
+        except IOError:
+            return []
+    return {"access": tail(LOG_PATH), "error": tail(XRAY_ERROR_LOG)}
 
 
 def tail_log():
@@ -935,14 +1170,15 @@ def snapshot():
     conn.close()
     used = int(traffic["total_rx"] + traffic["total_tx"]) if traffic else 0
     period_start, next_reset = server_period_bounds(stamp)
+    manager = service_status()
     return {
-        "server": {"name": "狗云", "host": SERVER_HOST, "online": bool(counter_rows), "xray": "26.3.27"},
+        "server": {"name": "狗云", "host": SERVER_HOST, "online": manager["running"], "xray": manager["version"]},
         "generatedAt": stamp,
         "totals": {"uplink": total_up, "downlink": total_down, "traffic": total_up + total_down},
         "bandwidth": {"limitBytes": SERVER_LIMIT_BYTES, "usedBytes": used, "remainingBytes": max(0, SERVER_LIMIT_BYTES - used),
                       "periodStart": period_start, "nextReset": next_reset, "measuredSince": int(traffic["measured_since"]) if traffic else stamp,
                       "periodDays": SERVER_PERIOD_DAYS, "source": "local"},
-        "links": links, "recentIps": recent, "series": buckets,
+        "links": links, "recentIps": recent, "series": buckets, "xrayManager": manager,
         "notice": "链接流量由 Xray 精确统计；来源 IP 来自连接日志。Xray 不会上报设备型号，可为 IP 添加设备备注并按备注批量封禁。服务器流量按 30 天账单周期统计，本机网卡口径可能与云厂商账单略有差异。",
     }
 
@@ -968,11 +1204,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path != "/v1/snapshot":
-            self.send_error(404); return
         if not self.authorized():
             self.send_error(401); return
-        self.send_json(200, snapshot())
+        if self.path == "/v1/snapshot": self.send_json(200, snapshot())
+        elif self.path == "/v1/xray/logs": self.send_json(200, read_logs())
+        else: self.send_error(404)
 
     def mutate(self, kind):
         if not self.authorized():
@@ -987,6 +1223,11 @@ class Handler(BaseHTTPRequestHandler):
                 elif kind == "create": create_link(payload)
                 elif kind == "update": update_link(payload)
                 elif kind == "delete": delete_link(payload)
+                elif kind == "command":
+                    result = run_service_action(payload)
+                    result["snapshot"] = snapshot()
+                    self.send_json(200, result)
+                    return
             self.send_json(200, snapshot())
         except ValueError as error:
             self.send_json(400, {"error": text_type(error)})
@@ -999,6 +1240,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/v1/ips": self.mutate("ip")
         elif self.path == "/v1/uuids": self.mutate("uuid")
         elif self.path == "/v1/links": self.mutate("create")
+        elif self.path == "/v1/xray/commands": self.mutate("command")
         else: self.send_error(404)
 
     def do_PATCH(self):

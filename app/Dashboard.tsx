@@ -342,16 +342,26 @@ function UuidDevices({ link, onSaved }: { link: LinkUsage; onSaved: (data: Monit
   );
 }
 
-function LinkEditor({ link, onSaved, onCancel }: {
+function LinkEditor({ link, protocols, onSaved, onCancel }: {
   link?: LinkUsage;
+  protocols: MonitorSnapshot["xrayManager"]["protocols"];
   onSaved: (data: MonitorSnapshot) => void;
   onCancel: () => void;
 }) {
   const [name, setName] = useState(link?.name ?? "");
   const [port, setPort] = useState(String(link?.port ?? 44301));
-  const [sni, setSni] = useState("www.cloudflare.com");
+  const [protocolId, setProtocolId] = useState(link?.config.protocolId ?? "vless-reality");
+  const [host, setHost] = useState(link?.config.host ?? "");
+  const [path, setPath] = useState(link?.config.path ?? "");
+  const [sni, setSni] = useState(link?.config.sni || "www.cloudflare.com");
+  const [headerType, setHeaderType] = useState(link?.config.headerType || "none");
+  const [method, setMethod] = useState(link?.config.method || "aes-256-gcm");
+  const [username, setUsername] = useState(link?.config.username ?? "");
+  const [credential, setCredential] = useState("");
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
+  const definition = protocols.find((item) => item.id === protocolId);
+  const kind = definition?.kind ?? "reality";
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -361,7 +371,11 @@ function LinkEditor({ link, onSaved, onCancel }: {
       const response = await fetch("/api/links", {
         method: link ? "PATCH" : "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tag: link?.id, name, port: Number(port), sni }),
+        body: JSON.stringify({
+          tag: link?.id, name, protocolId, port: Number(port), host, path, sni,
+          headerType, method, username,
+          ...(link ? { credential } : kind === "socks" || kind === "shadowsocks" ? { password: credential } : { uuid: credential }),
+        }),
       });
       const payload = await response.json();
       if (response.status === 401) return window.location.assign("/login");
@@ -378,19 +392,128 @@ function LinkEditor({ link, onSaved, onCancel }: {
   return (
     <form className="link-editor" onSubmit={submit}>
       <div className="link-editor-heading">
-        <div><strong>{link ? "编辑 Reality 链接" : "创建 Reality 链接"}</strong><span>无需新增域名，保存后立即可用</span></div>
+        <div><strong>{link ? "编辑 Xray 链接" : "创建 Xray 链接"}</strong><span>{link ? "保存前自动备份，变更后立即生效" : "调用服务器现有 233boy Xray 脚本创建"}</span></div>
         <button type="button" onClick={onCancel} aria-label="关闭">×</button>
       </div>
       <div className="link-editor-fields">
         <label><span>名称</span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：手机专用" required maxLength={32} /></label>
-        <label><span>端口</span><input type="number" min="1024" max="65535" value={port} onChange={(event) => setPort(event.target.value)} required /></label>
-        <label><span>Reality 伪装域名</span><input value={sni} onChange={(event) => setSni(event.target.value)} required /></label>
+        <label><span>协议</span><select value={protocolId} disabled={Boolean(link)} onChange={(event) => setProtocolId(event.target.value)}>{protocols.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+        {kind !== "tls" ? <label><span>入口端口</span><input type="number" min="1024" max="65535" value={port} onChange={(event) => setPort(event.target.value)} required /></label> : null}
+        {kind === "tls" ? <label><span>TLS 域名</span><input value={host} onChange={(event) => setHost(event.target.value)} placeholder="已解析到本机的域名" required /></label> : null}
+        {kind === "tls" ? <label><span>传输路径</span><input value={path} onChange={(event) => setPath(event.target.value)} placeholder="/xray-path" required /></label> : null}
+        {kind === "reality" ? <label><span>Reality SNI</span><input value={sni} onChange={(event) => setSni(event.target.value)} required /></label> : null}
+        {kind === "direct" ? <label><span>伪装类型</span><select value={headerType} onChange={(event) => setHeaderType(event.target.value)}><option value="none">none</option><option value="http">http</option><option value="wechat-video">wechat-video</option><option value="srtp">srtp</option></select></label> : null}
+        {kind === "shadowsocks" ? <label><span>加密方式</span><select value={method} onChange={(event) => setMethod(event.target.value)}><option value="aes-256-gcm">aes-256-gcm</option><option value="aes-128-gcm">aes-128-gcm</option><option value="chacha20-poly1305">chacha20-poly1305</option><option value="xchacha20-poly1305">xchacha20-poly1305</option></select></label> : null}
+        {kind === "socks" ? <label><span>Socks 用户名</span><input value={username} disabled={Boolean(link)} onChange={(event) => setUsername(event.target.value)} required /></label> : null}
+        <label className="credential-field"><span>{kind === "shadowsocks" || kind === "socks" ? "密码" : "UUID"}</span><input type="password" value={credential} onChange={(event) => setCredential(event.target.value)} placeholder={link ? "留空则保持不变" : "留空自动生成"} required={kind === "socks" && !link} /></label>
       </div>
       <div className="link-editor-actions">
         <span className="form-error" role="status">{message}</span>
         <button type="submit" disabled={saving}>{saving ? "保存中…" : link ? "保存修改" : "创建链接"}</button>
       </div>
     </form>
+  );
+}
+
+function XrayControlPanel({ data, onSaved, onError }: {
+  data: MonitorSnapshot;
+  onSaved: (data: MonitorSnapshot) => void;
+  onError: (message: string) => void;
+}) {
+  const [running, setRunning] = useState("");
+  const [output, setOutput] = useState("等待操作");
+  const [logs, setLogs] = useState<{ access: string[]; error: string[] } | null>(null);
+  const [logType, setLogType] = useState<"access" | "error">("error");
+  const manager = data.xrayManager;
+
+  async function command(action: string, confirmation?: string) {
+    if (confirmation && !window.confirm(confirmation)) return;
+    setRunning(action);
+    onError("");
+    try {
+      const response = await fetch("/api/xray/commands", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      const payload = await response.json();
+      if (response.status === 401) return window.location.assign("/login");
+      if (!response.ok) throw new Error(payload.error || "命令执行失败");
+      setOutput(payload.output || "命令执行完成");
+      onSaved(payload.snapshot);
+    } catch (reason) {
+      onError(reason instanceof Error ? reason.message : "命令执行失败");
+    } finally {
+      setRunning("");
+    }
+  }
+
+  async function loadLogs() {
+    setRunning("logs");
+    try {
+      const response = await fetch("/api/xray/logs", { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "日志读取失败");
+      setLogs(payload);
+      setOutput("日志已刷新");
+    } catch (reason) {
+      onError(reason instanceof Error ? reason.message : "日志读取失败");
+    } finally {
+      setRunning("");
+    }
+  }
+
+  const busy = Boolean(running);
+  return (
+    <section className="xray-console" aria-label="Xray 控制面板">
+      <div className="console-heading">
+        <div>
+          <p className="eyebrow">XRAY CONTROL</p>
+          <h2>Xray 服务控制</h2>
+          <span>{manager.script} · {manager.version}</span>
+        </div>
+        <div className="service-badges">
+          <span className={manager.running ? "ok" : "down"}><i />Xray {manager.running ? "运行中" : "已停止"}</span>
+          <span className={manager.caddyRunning ? "ok" : "down"}><i />Caddy {manager.caddyRunning ? "运行中" : "已停止"}</span>
+        </div>
+      </div>
+      <div className="console-grid">
+        <div className="command-group">
+          <strong>服务</strong><span>对应 xray start / stop / restart / test</span>
+          <div className="command-buttons">
+            <button type="button" disabled={busy || manager.running} onClick={() => command("start")}>启动</button>
+            <button type="button" disabled={busy || !manager.running} onClick={() => command("restart")}>重启</button>
+            <button type="button" disabled={busy} onClick={() => command("test")}>配置检测</button>
+            <button type="button" className="danger-button" disabled={busy || !manager.running} onClick={() => command("stop", "停止后所有代理链接都会断开，确定继续吗？")}>停止</button>
+          </div>
+        </div>
+        <div className="command-group">
+          <strong>修复</strong><span>执行前建议先运行配置检测</span>
+          <div className="command-buttons">
+            <button type="button" disabled={busy} onClick={() => command("fix-all", "将修复全部 Xray 配置并可能重启服务，确定继续吗？")}>修复全部配置</button>
+            <button type="button" disabled={busy} onClick={() => command("fix-config", "将重建 Xray 主配置，确定继续吗？")}>重建主配置</button>
+            <button type="button" disabled={busy} onClick={() => command("fix-caddy", "将重建 Caddy 配置并重启 Caddy，确定继续吗？")}>修复 Caddy</button>
+          </div>
+        </div>
+        <div className="command-group">
+          <strong>更新</strong><span>对应 xray update，完成后服务可能自动重启</span>
+          <div className="command-buttons">
+            <button type="button" disabled={busy} onClick={() => command("update-core", "确定在线更新 Xray 内核吗？")}>更新内核</button>
+            <button type="button" disabled={busy} onClick={() => command("update-script", "确定在线更新 233boy 脚本吗？")}>更新脚本</button>
+            <button type="button" disabled={busy} onClick={() => command("update-data")}>更新规则数据</button>
+            <button type="button" disabled={busy} onClick={() => command("update-caddy", "确定在线更新 Caddy 吗？")}>更新 Caddy</button>
+          </div>
+        </div>
+      </div>
+      <div className="console-output">
+        <div><strong>最近输出</strong><span>{running ? "命令执行中，请勿关闭页面…" : output}</span><button type="button" onClick={loadLogs} disabled={busy}>{running === "logs" ? "读取中…" : "查看日志"}</button></div>
+        {logs ? <div className="log-viewer"><div><button type="button" className={logType === "error" ? "active" : ""} onClick={() => setLogType("error")}>错误日志</button><button type="button" className={logType === "access" ? "active" : ""} onClick={() => setLogType("access")}>访问日志</button></div><pre>{(logs[logType] || []).join("\n") || "暂无日志"}</pre></div> : null}
+      </div>
+      <div className="audit-strip">
+        <strong>操作审计</strong>
+        {manager.audit.length ? manager.audit.slice(0, 5).map((item, index) => <span key={`${item.created_at}-${index}`} className={item.success ? "success" : "failed"}>{item.success ? "成功" : "失败"} · {item.action} · {formatTime(item.created_at)}</span>) : <span>尚无面板命令记录</span>}
+      </div>
+    </section>
   );
 }
 
@@ -523,6 +646,27 @@ export default function Dashboard() {
     }
   }
 
+  async function copyLink(link: LinkUsage) {
+    try {
+      let uri = link.shareUri;
+      if (!uri) {
+        const response = await fetch("/api/xray/commands", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "link-url", tag: link.id }),
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || "链接生成失败");
+        uri = payload.shareUri;
+        setData(payload.snapshot);
+      }
+      if (!uri) throw new Error("该配置没有可复制的客户端链接");
+      await navigator.clipboard.writeText(uri);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "复制失败");
+    }
+  }
+
   const bandwidth = data?.bandwidth;
   const bandwidthPercent = bandwidth ? Math.min(100, bandwidth.usedBytes / Math.max(1, bandwidth.limitBytes) * 100) : 0;
 
@@ -588,6 +732,8 @@ export default function Dashboard() {
         </div>
       </section>
 
+      {data ? <XrayControlPanel data={data} onSaved={setData} onError={setError} /> : null}
+
       <section className="workspace">
         <div className="links-panel">
           <div className="section-title">
@@ -597,7 +743,7 @@ export default function Dashboard() {
             </div>
             <button type="button" onClick={() => setCreating((value) => !value)}>{creating ? "收起" : "+ 创建链接"}</button>
           </div>
-          {creating ? <LinkEditor onSaved={setData} onCancel={() => setCreating(false)} /> : null}
+          {creating && data ? <LinkEditor protocols={data.xrayManager.protocols} onSaved={setData} onCancel={() => setCreating(false)} /> : null}
           <div className="link-table-head" aria-hidden="true">
             <span>链接</span><span>入口</span><span>总流量</span><span>相对用量</span><span>设备 / 来源</span>
           </div>
@@ -631,15 +777,15 @@ export default function Dashboard() {
           {selectedLink ? <ExpiryEditor key={`expiry-${selectedLink.id}`} link={selectedLink} onSaved={setData} /> : null}
           {selectedLink?.managed ? (
             <div className="managed-link-actions">
-              <div><strong>后台创建的链接</strong><span>可编辑、复制或删除；配置变更会立即生效</span></div>
+              <div><strong>Xray 配置管理</strong><span>已接管服务器现有配置；编辑前自动备份</span></div>
               <div>
-                {selectedLink.shareUri ? <button type="button" onClick={() => navigator.clipboard.writeText(selectedLink.shareUri || "")}>复制链接</button> : null}
+                <button type="button" onClick={() => copyLink(selectedLink)}>复制链接</button>
                 <button type="button" onClick={() => setEditingLink((value) => !value)}>编辑</button>
                 <button type="button" className="danger-button" onClick={() => deleteLink(selectedLink)}>删除</button>
               </div>
             </div>
-          ) : selectedLink ? <p className="legacy-note">这是服务器原有链接。为保护现有域名/CDN 配置，后台仅提供查询与额度管理。</p> : null}
-          {selectedLink?.managed && editingLink ? <LinkEditor link={selectedLink} onSaved={setData} onCancel={() => setEditingLink(false)} /> : null}
+          ) : null}
+          {selectedLink?.managed && editingLink && data ? <LinkEditor link={selectedLink} protocols={data.xrayManager.protocols} onSaved={setData} onCancel={() => setEditingLink(false)} /> : null}
           <div className="ip-list">
             {ips.length ? ips.slice(0, 14).map((item) => {
               return <IpControlRow key={`${item.tag}-${item.ip}`} item={item} now={now} onSaved={setData} />;

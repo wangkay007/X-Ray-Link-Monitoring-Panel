@@ -24,6 +24,15 @@ export type LinkUsage = {
   port: number;
   managed: boolean;
   shareUri: string | null;
+  config: {
+    protocolId: string;
+    host: string;
+    path: string;
+    sni: string;
+    headerType: string;
+    method: string;
+    username: string;
+  };
   disabled: boolean;
   devices: UuidDevice[];
   uplink: number;
@@ -66,5 +75,13 @@ export type MonitorSnapshot = {
   links: LinkUsage[];
   recentIps: Array<IpUsage & { tag: string; linkName: string }>;
   series: Record<string, { uplink: number; downlink: number }>;
+  xrayManager: {
+    running: boolean;
+    caddyRunning: boolean;
+    version: string;
+    script: string;
+    protocols: Array<{ id: string; label: string; alias: string; kind: "reality" | "direct" | "tls" | "shadowsocks" | "socks" }>;
+    audit: Array<{ action: string; target: string; success: number; output: string; created_at: number }>;
+  };
   notice: string;
 };

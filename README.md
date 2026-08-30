@@ -13,7 +13,10 @@
 - 为链接设置月度流量额度，达到上限后自动停用
 - 为链接设置到期时间，到期后自动停用
 - 查看服务器网卡账单周期流量（默认额度 500 GiB，可配置重置锚点和周期天数）
-- 创建、编辑、复制和删除面板托管的 VLESS Reality 链接
+- 可视化管理服务器现有的 233boy Xray 脚本：启动、停止、重启、配置检测、修复、更新和日志
+- 创建、编辑、复制和删除 Xray 链接，支持 VLESS、VMess、Trojan、Shadowsocks 和 Socks 的 12 种常用组合
+- 所有面板命令使用服务端白名单和参数校验，不向浏览器开放任意 Shell
+- 配置变更前自动备份，并记录命令成功/失败、目标和时间
 - 管理后台登录保护，所有写操作均在服务端鉴权
 
 ## 需要了解的限制
@@ -23,6 +26,20 @@
 - Xray 协议不会传递浏览器 User-Agent，因此通常无法可靠获取手机型号、系统型号或硬件编号。
 - UUID 被禁用后不能建立新连接；已经存在的长连接可能需要短暂时间才会结束。
 - 服务器周期流量来自指定网卡的本机计数，不等同于云厂商计费后台，重装系统或重置网卡可能影响统计。
+- TLS 类链接需要一个已经解析到服务器的域名；创建时 233boy 脚本会继续负责 Caddy 和证书配置。
+- 为防止误操作和任意命令执行，面板不开放卸载、重装、`bin`、`api`、`xapi`、`debug` 等原始高风险入口。
+
+### 支持创建的协议
+
+| 协议 | 面板标识 | 创建时需要 |
+| --- | --- | --- |
+| VLESS Reality | `vless-reality` | 端口、SNI；UUID 可自动生成 |
+| VMess TCP / mKCP | `vmess-tcp` / `vmess-mkcp` | 端口、伪装类型；UUID 可自动生成 |
+| VMess WS / gRPC TLS | `vmess-ws-tls` / `vmess-grpc-tls` | 已解析域名、路径 |
+| VLESS WS / gRPC / XHTTP TLS | `vless-ws-tls` / `vless-grpc-tls` / `vless-xhttp-tls` | 已解析域名、路径 |
+| Trojan WS / gRPC TLS | `trojan-ws-tls` / `trojan-grpc-tls` | 已解析域名、路径 |
+| Shadowsocks | `shadowsocks` | 端口、加密方式；密码可自动生成 |
+| Socks | `socks` | 端口、用户名和密码 |
 
 ## 架构
 
@@ -32,7 +49,8 @@ flowchart LR
     Panel -->|"Bearer Token / HTTPS"| Collector["服务器采集 API"]
     Collector --> Stats["Xray Stats / Handler / Routing API"]
     Collector --> Logs["Xray access.log"]
-    Collector --> Config["Xray JSON 配置"]
+    Collector --> Manager["233boy xray 命令白名单"]
+    Manager --> Config["Xray / Caddy 配置"]
     Collector --> DB["本地 SQLite"]
 ```
 
@@ -48,6 +66,7 @@ flowchart LR
 
 - Linux + systemd
 - 已安装并正常运行的 Xray
+- 如需使用可视化命令和全协议 CRUD，需安装 233boy Xray 管理脚本并能执行 `xray help`
 - 已安装 Caddy，主配置会导入 `/etc/caddy/sites/*.conf`
 - Python 3、curl、OpenSSL
 - 一个已解析到服务器的 HTTPS API 域名，例如 `monitor.example.com`
@@ -175,6 +194,9 @@ journalctl -u xray-monitor -f
 
 # 重启采集器
 systemctl restart xray-monitor
+
+# 面板使用的 Xray 管理脚本
+xray help
 
 # 本机健康检查
 source /etc/xray-monitor.env

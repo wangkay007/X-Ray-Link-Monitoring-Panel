@@ -75,3 +75,20 @@ test("uses a configurable rolling server traffic period", async () => {
   assert.match(dashboard, /服务器本周期剩余/);
   assert.doesNotMatch(dashboard, /服务器本月剩余/);
 });
+
+test("exposes validated Xray management without a raw shell endpoint", async () => {
+  const [collector, dashboard, commandRoute] = await Promise.all([
+    readFile(new URL("collector/xray_monitor.py", root), "utf8"),
+    readFile(new URL("app/Dashboard.tsx", root), "utf8"),
+    readFile(new URL("app/api/xray/commands/route.ts", root), "utf8"),
+  ]);
+
+  assert.match(collector, /SERVICE_ACTIONS = \{/);
+  assert.match(collector, /if action not in SERVICE_ACTIONS/);
+  assert.match(collector, /"vless-xhttp-tls"/);
+  assert.match(collector, /"trojan-grpc-tls"/);
+  assert.doesNotMatch(collector, /shell\s*=\s*True/);
+  assert.match(dashboard, /Xray 服务控制/);
+  assert.match(dashboard, /修复全部配置/);
+  assert.match(commandRoute, /isAuthenticated/);
+});

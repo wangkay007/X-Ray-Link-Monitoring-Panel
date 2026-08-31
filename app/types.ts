@@ -92,6 +92,7 @@ export type WebsiteReport = {
   rangeStart: number;
   retentionDays: number;
   summary: { connections: number; targets: number; ips: number; devices: number; latest: number };
+  pagination: { page: number; pageSize: 15; totalItems: number; totalPages: number };
   topTargets: Array<{
     target: string;
     port: number;

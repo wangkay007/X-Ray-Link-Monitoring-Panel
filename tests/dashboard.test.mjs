@@ -105,6 +105,8 @@ test("collects target domains behind an authenticated website activity API", asy
   assert.match(collector, /WEBSITE_RETENTION_DAYS/);
   assert.match(dashboard, /访问网站/);
   assert.match(dashboard, /UUID 设备/);
+  assert.match(dashboard, /最近访问分页/);
+  assert.match(dashboard, /每页.*15/);
   assert.match(dashboard, /HTTPS 内容仍然加密/);
   assert.match(route, /isAuthenticated/);
 });

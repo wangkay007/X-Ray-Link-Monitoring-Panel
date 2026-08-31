@@ -1123,6 +1123,12 @@ def website_report(params):
     ranges = {"1h": 3600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
     range_key = (params.get("range") or ["24h"])[0]
     if range_key not in ranges: raise ValueError("时间范围不正确")
+    try:
+        page = int((params.get("page") or ["1"])[0])
+    except (TypeError, ValueError):
+        raise ValueError("页码不正确")
+    if page < 1 or page > 1000000: raise ValueError("页码不正确")
+    page_size = 15
     stamp = now()
     start = stamp - ranges[range_key]
     links = discover_links()
@@ -1149,7 +1155,12 @@ def website_report(params):
     conn = db()
     summary = conn.execute("SELECT COALESCE(SUM(connections),0) AS connections,COUNT(DISTINCT target) AS targets,COUNT(DISTINCT ip) AS ips,COUNT(DISTINCT CASE WHEN email!='' THEN email END) AS devices,COALESCE(MAX(last_seen),0) AS latest FROM website_usage WHERE " + where, values).fetchone()
     top_rows = list(conn.execute("SELECT target,port,SUM(connections) AS connections,COUNT(DISTINCT ip) AS unique_ips,COUNT(DISTINCT tag) AS unique_links,MAX(last_seen) AS last_seen FROM website_usage WHERE " + where + " GROUP BY target,port ORDER BY connections DESC,last_seen DESC LIMIT 12", values))
-    visit_rows = list(conn.execute("SELECT tag,ip,target,port,network,email,SUM(connections) AS connections,MIN(first_seen) AS first_seen,MAX(last_seen) AS last_seen FROM website_usage WHERE " + where + " GROUP BY tag,ip,target,port,network,email ORDER BY last_seen DESC LIMIT 120", values))
+    total_items = int(conn.execute("SELECT COUNT(*) AS total FROM (SELECT 1 FROM website_usage WHERE " + where + " GROUP BY tag,ip,target,port,network,email)", values).fetchone()["total"])
+    total_pages = (total_items + page_size - 1) // page_size
+    if total_pages and page > total_pages: page = total_pages
+    if not total_pages: page = 1
+    offset = (page - 1) * page_size
+    visit_rows = list(conn.execute("SELECT tag,ip,target,port,network,email,SUM(connections) AS connections,MIN(first_seen) AS first_seen,MAX(last_seen) AS last_seen FROM website_usage WHERE " + where + " GROUP BY tag,ip,target,port,network,email ORDER BY last_seen DESC LIMIT ? OFFSET ?", values + [page_size, offset]))
     conn.close()
     device_map = {}
     for link_tag, link in links.items():
@@ -1177,6 +1188,7 @@ def website_report(params):
         "retentionDays": WEBSITE_RETENTION_DAYS,
         "summary": {"connections": int(summary["connections"]), "targets": int(summary["targets"]),
                     "ips": int(summary["ips"]), "devices": int(summary["devices"]), "latest": int(summary["latest"])},
+        "pagination": {"page": page, "pageSize": page_size, "totalItems": total_items, "totalPages": total_pages},
         "topTargets": top_targets, "visits": visits,
     }
 

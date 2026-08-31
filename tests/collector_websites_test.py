@@ -46,6 +46,16 @@ class WebsiteCollectionTest(unittest.TestCase):
         self.assertEqual(report["summary"]["connections"], 1)
         self.assertEqual(report["topTargets"][0]["target"], "chatgpt.com")
         self.assertEqual(report["visits"][0]["deviceUuid"], self.uuid)
+        for index in range(17):
+            extra = "%s.123456 from 203.0.113.8:0 accepted tcp:page-%s.example.com:443 [%s -> direct] email: %s\n" % (
+                timestamp, index, self.tag, self.collector.device_email(self.uuid))
+            self.collector.record_access(extra)
+        first_page = self.collector.website_report({"range": ["24h"], "page": ["1"]})
+        second_page = self.collector.website_report({"range": ["24h"], "page": ["2"]})
+        self.assertEqual(first_page["pagination"], {"page": 1, "pageSize": 15, "totalItems": 18, "totalPages": 2})
+        self.assertEqual(len(first_page["visits"]), 15)
+        self.assertEqual(len(second_page["visits"]), 3)
+        self.assertFalse(set(item["target"] for item in first_page["visits"]) & set(item["target"] for item in second_page["visits"]))
         self.collector.clear_website_history({"confirm": True})
         self.assertEqual(self.collector.website_report({})["summary"]["connections"], 0)
 

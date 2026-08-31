@@ -524,14 +524,14 @@ function WebsiteActivity({ snapshot }: { snapshot: MonitorSnapshot }) {
   const [device, setDevice] = useState("");
   const [ip, setIp] = useState("");
   const [keyword, setKeyword] = useState("");
-  const [query, setQuery] = useState({ range: "24h", tag: "", device: "", ip: "", keyword: "" });
+  const [query, setQuery] = useState({ range: "24h", tag: "", device: "", ip: "", keyword: "", page: 1 });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
-    const params = new URLSearchParams({ range: query.range });
+    const params = new URLSearchParams({ range: query.range, page: String(query.page) });
     if (query.tag) params.set("tag", query.tag);
     if (query.device) params.set("device", query.device);
     if (query.ip) params.set("ip", query.ip);
@@ -574,6 +574,7 @@ function WebsiteActivity({ snapshot }: { snapshot: MonitorSnapshot }) {
   }
 
   const devices = snapshot.links.flatMap((link) => link.devices.map((item) => ({ ...item, linkName: link.name })));
+  const pagination = report?.pagination;
   return (
     <section className="website-activity" aria-labelledby="website-activity-title">
       <div className="website-heading">
@@ -584,7 +585,7 @@ function WebsiteActivity({ snapshot }: { snapshot: MonitorSnapshot }) {
         <button type="button" className="danger-button" onClick={clearHistory} disabled={loading || !report?.summary.connections}>清除历史</button>
       </div>
 
-      <form className="website-filters" onSubmit={(event) => { event.preventDefault(); setQuery({ range, tag, device, ip: ip.trim(), keyword: keyword.trim() }); }}>
+      <form className="website-filters" onSubmit={(event) => { event.preventDefault(); setQuery({ range, tag, device, ip: ip.trim(), keyword: keyword.trim(), page: 1 }); }}>
         <label><span>时间</span><select value={range} onChange={(event) => setRange(event.target.value as WebsiteReport["range"])}><option value="1h">最近 1 小时</option><option value="24h">最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option></select></label>
         <label><span>链接</span><select value={tag} onChange={(event) => setTag(event.target.value)}><option value="">全部链接</option>{snapshot.links.map((link) => <option key={link.id} value={link.id}>{link.name}</option>)}</select></label>
         <label><span>UUID 设备</span><select value={device} onChange={(event) => setDevice(event.target.value)}><option value="">全部设备</option>{devices.map((item) => <option key={`${item.linkName}-${item.uuid}`} value={item.uuid}>{item.deviceLabel || item.code} · {item.linkName}</option>)}</select></label>
@@ -615,7 +616,7 @@ function WebsiteActivity({ snapshot }: { snapshot: MonitorSnapshot }) {
         </div>
 
         <div className="visit-table-wrap">
-          <div className="website-subheading"><strong>最近访问</strong><span>最多显示 120 条汇总记录</span></div>
+          <div className="website-subheading"><strong>最近访问</strong><span>{pagination ? `${pagination.totalItems} 条记录 · 每页 ${pagination.pageSize} 条` : "每页 15 条"}</span></div>
           <div className="visit-table-head" aria-hidden="true"><span>目标</span><span>链接 / 设备</span><span>来源 IP</span><span>次数</span><span>时间</span></div>
           <div className="visit-list">
             {report?.visits.length ? report.visits.map((item) => (
@@ -628,6 +629,15 @@ function WebsiteActivity({ snapshot }: { snapshot: MonitorSnapshot }) {
               </div>
             )) : null}
           </div>
+          {pagination && pagination.totalItems > 0 ? (
+            <nav className="website-pagination" aria-label="最近访问分页">
+              <span>第 <b>{pagination.page}</b> / {pagination.totalPages} 页</span>
+              <div>
+                <button type="button" disabled={loading || pagination.page <= 1} onClick={() => setQuery((current) => ({ ...current, page: current.page - 1 }))}>上一页</button>
+                <button type="button" disabled={loading || pagination.page >= pagination.totalPages} onClick={() => setQuery((current) => ({ ...current, page: current.page + 1 }))}>下一页</button>
+              </div>
+            </nav>
+          ) : null}
         </div>
       </div>
       <p className="website-privacy-note">HTTPS 内容仍然加密：这里看不到具体页面、搜索词、账号、密码或正文。使用 ECH、二级代理或直接连接 IP 时，域名可能显示为目标 IP。</p>

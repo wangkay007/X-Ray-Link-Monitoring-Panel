@@ -7,6 +7,8 @@
 - 查看服务器、Xray 服务和采集时间状态
 - 按链接统计上行、下行和累计流量
 - 查看每条链接的历史来源 IP、连接次数和最后连接时间
+- 查看代理连接访问的目标域名或 IP，支持按时间、链接、UUID、来源 IP 和关键词筛选
+- 查看目标域名连接次数排行，并默认保留 30 天访问历史
 - 展示同一入站 `clients` 中的全部 UUID
 - 为 IP、设备备注和 UUID 设置备注
 - 单独禁用/恢复 IP 或 UUID
@@ -24,6 +26,8 @@
 - 面板展示的 UUID 是 **Xray 客户端凭据**，不是手机或电脑的硬件序列号。
 - 多个设备使用不同 UUID 时，可以分别展示和禁用；多个实体设备共用同一个 UUID 时，Xray 无法区分它们。
 - Xray 协议不会传递浏览器 User-Agent，因此通常无法可靠获取手机型号、系统型号或硬件编号。
+- 访问网站记录来自 Xray 连接日志：HTTPS 只能看到目标域名或 IP 和端口，看不到具体页面路径、搜索词、账号、密码或网页正文。
+- 使用 ECH、二级代理或直接连接 IP 时，日志可能只能显示目标 IP，无法还原域名。
 - UUID 被禁用后不能建立新连接；已经存在的长连接可能需要短暂时间才会结束。
 - 服务器周期流量来自指定网卡的本机计数，不等同于云厂商计费后台，重装系统或重置网卡可能影响统计。
 - TLS 类链接需要一个已经解析到服务器的域名；创建时 233boy 脚本会继续负责 Caddy 和证书配置。
@@ -234,6 +238,7 @@ bash scripts/deploy-dashboard.sh
 | `XRAY_MONITOR_PERIOD_DAYS` | `30` | 服务器流量账单周期天数 |
 | `XRAY_MONITOR_RESET_ANCHOR` | `1970-01-01` | 账单周期重置锚点（`YYYY-MM-DD`）；例如某次重置为 2026-08-15，就填写该日期 |
 | `XRAY_MONITOR_STATIC_META` | `/etc/xray-monitor-static-meta.json` | 旧链接的自定义名称和入口映射 |
+| `XRAY_WEBSITE_RETENTION_DAYS` | `30` | 访问网站汇总记录保留天数 |
 
 旧配置需要自定义显示名称时，可参考
 [`collector/static-meta.example.json`](collector/static-meta.example.json)。

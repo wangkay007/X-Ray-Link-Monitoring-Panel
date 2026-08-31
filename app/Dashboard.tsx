@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import type { IpUsage, LinkUsage, MonitorSnapshot, UuidDevice } from "./types";
+import type { IpUsage, LinkUsage, MonitorSnapshot, UuidDevice, WebsiteReport } from "./types";
 
 function formatBytes(value: number) {
   if (!Number.isFinite(value) || value <= 0) return "0 B";
@@ -517,6 +517,124 @@ function XrayControlPanel({ data, onSaved, onError }: {
   );
 }
 
+function WebsiteActivity({ snapshot }: { snapshot: MonitorSnapshot }) {
+  const [report, setReport] = useState<WebsiteReport | null>(null);
+  const [range, setRange] = useState<WebsiteReport["range"]>("24h");
+  const [tag, setTag] = useState("");
+  const [device, setDevice] = useState("");
+  const [ip, setIp] = useState("");
+  const [keyword, setKeyword] = useState("");
+  const [query, setQuery] = useState({ range: "24h", tag: "", device: "", ip: "", keyword: "" });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    const params = new URLSearchParams({ range: query.range });
+    if (query.tag) params.set("tag", query.tag);
+    if (query.device) params.set("device", query.device);
+    if (query.ip) params.set("ip", query.ip);
+    if (query.keyword) params.set("q", query.keyword);
+    try {
+      const response = await fetch(`/api/websites?${params}`, { cache: "no-store" });
+      const payload = await response.json();
+      if (response.status === 401) return window.location.assign("/login");
+      if (!response.ok) throw new Error(payload.error || "访问记录加载失败");
+      setReport(payload);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "访问记录加载失败");
+    } finally {
+      setLoading(false);
+    }
+  }, [query]);
+
+  useEffect(() => {
+    const initial = window.setTimeout(load, 0);
+    return () => window.clearTimeout(initial);
+  }, [load]);
+
+  async function clearHistory() {
+    if (!window.confirm("确定清除全部访问网站历史吗？此操作不会影响 Xray 链接和流量统计。")) return;
+    setLoading(true);
+    try {
+      const response = await fetch("/api/websites", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "清除失败");
+      setReport(payload);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "清除失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const devices = snapshot.links.flatMap((link) => link.devices.map((item) => ({ ...item, linkName: link.name })));
+  return (
+    <section className="website-activity" aria-labelledby="website-activity-title">
+      <div className="website-heading">
+        <div>
+          <h2 id="website-activity-title">访问网站</h2>
+          <p>来自 Xray 连接日志，仅记录目标域名或 IP、端口和连接次数</p>
+        </div>
+        <button type="button" className="danger-button" onClick={clearHistory} disabled={loading || !report?.summary.connections}>清除历史</button>
+      </div>
+
+      <form className="website-filters" onSubmit={(event) => { event.preventDefault(); setQuery({ range, tag, device, ip: ip.trim(), keyword: keyword.trim() }); }}>
+        <label><span>时间</span><select value={range} onChange={(event) => setRange(event.target.value as WebsiteReport["range"])}><option value="1h">最近 1 小时</option><option value="24h">最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option></select></label>
+        <label><span>链接</span><select value={tag} onChange={(event) => setTag(event.target.value)}><option value="">全部链接</option>{snapshot.links.map((link) => <option key={link.id} value={link.id}>{link.name}</option>)}</select></label>
+        <label><span>UUID 设备</span><select value={device} onChange={(event) => setDevice(event.target.value)}><option value="">全部设备</option>{devices.map((item) => <option key={`${item.linkName}-${item.uuid}`} value={item.uuid}>{item.deviceLabel || item.code} · {item.linkName}</option>)}</select></label>
+        <label><span>来源 IP</span><input value={ip} onChange={(event) => setIp(event.target.value)} placeholder="例如 113.200.75.89" /></label>
+        <label className="website-search"><span>目标域名或 IP</span><input value={keyword} onChange={(event) => setKeyword(event.target.value)} placeholder="例如 chatgpt.com" /></label>
+        <button type="submit" disabled={loading}>{loading ? "查询中…" : "查询"}</button>
+      </form>
+
+      {error ? <div className="website-error" role="alert"><span>{error}</span><button type="button" onClick={load}>重试</button></div> : null}
+      <div className="website-summary" aria-live="polite">
+        <span><b>{report?.summary.connections ?? 0}</b> 次连接</span>
+        <span><b>{report?.summary.targets ?? 0}</b> 个目标</span>
+        <span><b>{report?.summary.ips ?? 0}</b> 个来源 IP</span>
+        <span><b>{report?.summary.devices ?? 0}</b> 个已识别设备</span>
+        <small>{report ? `记录保留 ${report.retentionDays} 天 · 最后访问 ${formatTime(report.summary.latest)}` : "正在读取访问记录"}</small>
+      </div>
+
+      <div className="website-grid">
+        <div className="target-ranking">
+          <div className="website-subheading"><strong>访问排行</strong><span>按连接次数</span></div>
+          {report?.topTargets.length ? report.topTargets.map((item, index) => (
+            <div className="target-rank" key={`${item.target}-${item.port}`}>
+              <b>{String(index + 1).padStart(2, "0")}</b>
+              <div><strong>{item.target}</strong><span>{item.isIp ? `仅识别到 IP · ${item.port} 端口` : `${item.port} 端口`}</span></div>
+              <span>{item.connections} 次</span>
+            </div>
+          )) : <div className="website-empty"><strong>{loading ? "正在汇总…" : "暂无访问记录"}</strong><span>有新代理连接后会自动显示目标域名。</span></div>}
+        </div>
+
+        <div className="visit-table-wrap">
+          <div className="website-subheading"><strong>最近访问</strong><span>最多显示 120 条汇总记录</span></div>
+          <div className="visit-table-head" aria-hidden="true"><span>目标</span><span>链接 / 设备</span><span>来源 IP</span><span>次数</span><span>时间</span></div>
+          <div className="visit-list">
+            {report?.visits.length ? report.visits.map((item) => (
+              <div className="visit-row" key={`${item.tag}-${item.ip}-${item.target}-${item.port}-${item.deviceKey}`}>
+                <div><strong>{item.target}</strong><small>{item.network.toUpperCase()} · {item.port}{item.isIp ? " · 域名未知" : ""}</small></div>
+                <div><strong>{item.linkName}</strong><small>{item.deviceLabel || item.deviceCode || "设备未识别"}</small></div>
+                <code>{item.ip}</code>
+                <b>{item.connections}</b>
+                <time title={formatDateTime(item.last_seen)}>{relativeTime(item.last_seen, report.generatedAt)}</time>
+              </div>
+            )) : null}
+          </div>
+        </div>
+      </div>
+      <p className="website-privacy-note">HTTPS 内容仍然加密：这里看不到具体页面、搜索词、账号、密码或正文。使用 ECH、二级代理或直接连接 IP 时，域名可能显示为目标 IP。</p>
+    </section>
+  );
+}
+
 function IpControlRow({ item, now, onSaved }: {
   item: IpUsage & { tag: string; linkName: string };
   now: number;
@@ -733,6 +851,8 @@ export default function Dashboard() {
       </section>
 
       {data ? <XrayControlPanel data={data} onSaved={setData} onError={setError} /> : null}
+
+      {data ? <WebsiteActivity snapshot={data} /> : null}
 
       <section className="workspace">
         <div className="links-panel">

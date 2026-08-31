@@ -92,3 +92,19 @@ test("exposes validated Xray management without a raw shell endpoint", async () 
   assert.match(dashboard, /修复全部配置/);
   assert.match(commandRoute, /isAuthenticated/);
 });
+
+test("collects target domains behind an authenticated website activity API", async () => {
+  const [collector, dashboard, route] = await Promise.all([
+    readFile(new URL("collector/xray_monitor.py", root), "utf8"),
+    readFile(new URL("app/Dashboard.tsx", root), "utf8"),
+    readFile(new URL("app/api/websites/route.ts", root), "utf8"),
+  ]);
+
+  assert.match(collector, /CREATE TABLE IF NOT EXISTS website_usage/);
+  assert.match(collector, /def website_report/);
+  assert.match(collector, /WEBSITE_RETENTION_DAYS/);
+  assert.match(dashboard, /访问网站/);
+  assert.match(dashboard, /UUID 设备/);
+  assert.match(dashboard, /HTTPS 内容仍然加密/);
+  assert.match(route, /isAuthenticated/);
+});

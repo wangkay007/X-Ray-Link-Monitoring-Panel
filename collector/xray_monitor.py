@@ -19,10 +19,11 @@ import time
 
 try:
     from http.server import BaseHTTPRequestHandler, HTTPServer
-    from urllib.parse import quote as url_quote
+    from urllib.parse import quote as url_quote, parse_qs, urlparse
 except ImportError:
     from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
     from urllib import quote as url_quote
+    from urlparse import parse_qs, urlparse
 
 try:
     text_type = unicode
@@ -47,6 +48,7 @@ SERVER_PERIOD_DAYS = int(os.environ.get("XRAY_MONITOR_PERIOD_DAYS", "30"))
 SERVER_RESET_ANCHOR = os.environ.get("XRAY_MONITOR_RESET_ANCHOR", "1970-01-01")
 BACKUP_DIR = os.environ.get("XRAY_MONITOR_BACKUPS", "/var/lib/xray-monitor/backups")
 XRAY_ERROR_LOG = os.environ.get("XRAY_ERROR_LOG", "/var/log/xray/error.log")
+WEBSITE_RETENTION_DAYS = max(1, int(os.environ.get("XRAY_WEBSITE_RETENTION_DAYS", "30")))
 
 PROTOCOLS = {
     "vless-reality": {"label": "VLESS Reality", "alias": "reality", "kind": "reality"},
@@ -92,7 +94,7 @@ def load_static_meta():
 
 STATIC_META = load_static_meta()
 
-ACCESS_RE = re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+ from (\[[^\]]+\]|[^: ]+):\d+ .* \[([^ ]+) ")
+ACCESS_RE = re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+ from (\[[^\]]+\]|[^: ]+):\d+ accepted (tcp|udp):(.+):(\d+) \[([^ ]+) (?:->|>>) [^\]]+\](?: email: ([^ ]+))?")
 STAT_RE = re.compile(r'^inbound>>>(.+)>>>traffic>>>(uplink|downlink)$')
 DOMAIN_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
 MUTATION_LOCK = threading.Lock()
@@ -168,6 +170,20 @@ def init_db():
       output TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS command_audit_created_idx ON command_audit(created_at DESC);
+    CREATE TABLE IF NOT EXISTS website_usage (
+      bucket INTEGER NOT NULL, tag TEXT NOT NULL, ip TEXT NOT NULL,
+      target TEXT NOT NULL, port INTEGER NOT NULL, network TEXT NOT NULL,
+      email TEXT NOT NULL DEFAULT '', connections INTEGER NOT NULL DEFAULT 1,
+      first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
+      PRIMARY KEY (bucket, tag, ip, target, port, network, email)
+    );
+    CREATE INDEX IF NOT EXISTS website_usage_last_idx ON website_usage(last_seen DESC);
+    CREATE INDEX IF NOT EXISTS website_usage_target_idx ON website_usage(target, last_seen DESC);
+    CREATE INDEX IF NOT EXISTS website_usage_tag_idx ON website_usage(tag, last_seen DESC);
+    CREATE TABLE IF NOT EXISTS log_cursor (
+      path TEXT PRIMARY KEY, inode INTEGER NOT NULL DEFAULT 0,
+      offset INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0
+    );
     """)
     migrate_server_traffic(conn)
     conn.commit()
@@ -741,29 +757,51 @@ def save_uuid_control(payload):
         raise RuntimeError(error)
 
 
-def record_access(line):
+def record_access(line, conn=None, record_ip=True):
     match = ACCESS_RE.match(line)
     if not match:
         return
-    date_text, address, tag = match.groups()
+    date_text, address, network, target, target_port, tag, email = match.groups()
     if os.path.basename(tag) != tag or not os.path.isfile(os.path.join(XRAY_CONFIG_DIR, tag)):
         return
     address = address.strip("[]")
     if is_cloudflare_ip(address):
         return
+    target = target.strip("[]").strip().lower()
+    if len(target) > 253 or not (valid_ip(target) or (DOMAIN_RE.match(target) and ".." not in target)):
+        return
+    try:
+        target_port = int(target_port)
+    except Exception:
+        return
+    email = (email or "").strip()[:254]
     try:
         stamp = int(time.mktime(time.strptime(date_text, "%Y/%m/%d %H:%M:%S")))
     except Exception:
         stamp = now()
-    conn = db()
-    row = conn.execute("SELECT connections FROM ip_usage WHERE tag=? AND ip=?", (tag, address)).fetchone()
-    if row:
-        conn.execute("UPDATE ip_usage SET last_seen=?,connections=? WHERE tag=? AND ip=?", (stamp, row["connections"] + 1, tag, address))
+    owns_connection = conn is None
+    if owns_connection: conn = db()
+    if record_ip:
+        row = conn.execute("SELECT connections FROM ip_usage WHERE tag=? AND ip=?", (tag, address)).fetchone()
+        if row:
+            conn.execute("UPDATE ip_usage SET last_seen=?,connections=? WHERE tag=? AND ip=?", (stamp, row["connections"] + 1, tag, address))
+        else:
+            conn.execute("INSERT INTO ip_usage(tag,ip,first_seen,last_seen,connections) VALUES(?,?,?,?,1)", (tag, address, stamp, stamp))
+        conn.execute("INSERT OR IGNORE INTO ip_controls(ip,device_label,blocked,updated_at) VALUES(?,'',0,?)", (address, stamp))
+    bucket = stamp - stamp % 300
+    usage = conn.execute("SELECT connections,first_seen FROM website_usage WHERE bucket=? AND tag=? AND ip=? AND target=? AND port=? AND network=? AND email=?",
+                         (bucket, tag, address, target, target_port, network, email)).fetchone()
+    if usage:
+        conn.execute("UPDATE website_usage SET connections=?,last_seen=? WHERE bucket=? AND tag=? AND ip=? AND target=? AND port=? AND network=? AND email=?",
+                     (int(usage["connections"]) + 1, stamp, bucket, tag, address, target, target_port, network, email))
     else:
-        conn.execute("INSERT INTO ip_usage(tag,ip,first_seen,last_seen,connections) VALUES(?,?,?,?,1)", (tag, address, stamp, stamp))
-    conn.execute("INSERT OR IGNORE INTO ip_controls(ip,device_label,blocked,updated_at) VALUES(?,'',0,?)", (address, stamp))
-    conn.commit()
-    conn.close()
+        conn.execute("INSERT INTO website_usage(bucket,tag,ip,target,port,network,email,connections,first_seen,last_seen) VALUES(?,?,?,?,?,?,?,1,?,?)",
+                     (bucket, tag, address, target, target_port, network, email, stamp, stamp))
+    if stamp % 300 < 2:
+        conn.execute("DELETE FROM website_usage WHERE last_seen<?", (stamp - WEBSITE_RETENTION_DAYS * 86400,))
+    if owns_connection:
+        conn.commit()
+        conn.close()
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -945,7 +983,7 @@ def create_link(payload):
 def migrate_tag(old_tag, new_tag):
     if old_tag == new_tag: return
     conn = db()
-    for table in ("counters", "ip_usage", "samples", "quotas", "expirations", "uuid_controls"):
+    for table in ("counters", "ip_usage", "samples", "quotas", "expirations", "uuid_controls", "website_usage"):
         try: conn.execute("UPDATE OR IGNORE %s SET tag=? WHERE tag=?" % table, (new_tag, old_tag))
         except sqlite3.Error: pass
     conn.execute("UPDATE OR REPLACE link_meta SET tag=? WHERE tag=?", (new_tag, old_tag))
@@ -1081,22 +1119,121 @@ def read_logs():
     return {"access": tail(LOG_PATH), "error": tail(XRAY_ERROR_LOG)}
 
 
+def website_report(params):
+    ranges = {"1h": 3600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
+    range_key = (params.get("range") or ["24h"])[0]
+    if range_key not in ranges: raise ValueError("时间范围不正确")
+    stamp = now()
+    start = stamp - ranges[range_key]
+    links = discover_links()
+    conditions = ["last_seen>=?"]
+    values = [start]
+    tag = (params.get("tag") or [""])[0].strip()
+    if tag:
+        if tag not in links: raise ValueError("找不到该链接")
+        conditions.append("tag=?"); values.append(tag)
+    address = (params.get("ip") or [""])[0].strip()
+    if address:
+        if not valid_ip(address): raise ValueError("来源 IP 格式不正确")
+        conditions.append("ip=?"); values.append(address)
+    device = (params.get("device") or [""])[0].strip().lower()
+    if device:
+        if not UUID_RE.match(device): raise ValueError("设备 UUID 格式不正确")
+        conditions.append("email=?"); values.append(device_email(device))
+    keyword = (params.get("q") or [""])[0].strip().lower()
+    if keyword:
+        if len(keyword) > 80: raise ValueError("搜索内容过长")
+        conditions.append("target LIKE ? ESCAPE '\\'")
+        values.append("%" + keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
+    where = " AND ".join(conditions)
+    conn = db()
+    summary = conn.execute("SELECT COALESCE(SUM(connections),0) AS connections,COUNT(DISTINCT target) AS targets,COUNT(DISTINCT ip) AS ips,COUNT(DISTINCT CASE WHEN email!='' THEN email END) AS devices,COALESCE(MAX(last_seen),0) AS latest FROM website_usage WHERE " + where, values).fetchone()
+    top_rows = list(conn.execute("SELECT target,port,SUM(connections) AS connections,COUNT(DISTINCT ip) AS unique_ips,COUNT(DISTINCT tag) AS unique_links,MAX(last_seen) AS last_seen FROM website_usage WHERE " + where + " GROUP BY target,port ORDER BY connections DESC,last_seen DESC LIMIT 12", values))
+    visit_rows = list(conn.execute("SELECT tag,ip,target,port,network,email,SUM(connections) AS connections,MIN(first_seen) AS first_seen,MAX(last_seen) AS last_seen FROM website_usage WHERE " + where + " GROUP BY tag,ip,target,port,network,email ORDER BY last_seen DESC LIMIT 120", values))
+    conn.close()
+    device_map = {}
+    for link_tag, link in links.items():
+        for item in link.get("devices", []):
+            device_map[(link_tag, device_email(item["uuid"]))] = item
+    top_targets = []
+    for row in top_rows:
+        item = dict(row)
+        item["isIp"] = valid_ip(item["target"])
+        top_targets.append(item)
+    visits = []
+    for row in visit_rows:
+        item = dict(row)
+        known = device_map.get((item["tag"], item["email"]), {})
+        item.update({
+            "linkName": links.get(item["tag"], {}).get("name", item["tag"]),
+            "deviceUuid": known.get("uuid"), "deviceCode": known.get("code"),
+            "deviceLabel": known.get("deviceLabel") or "", "deviceKey": item["email"],
+            "isIp": valid_ip(item["target"]),
+        })
+        item.pop("email", None)
+        visits.append(item)
+    return {
+        "generatedAt": stamp, "range": range_key, "rangeStart": start,
+        "retentionDays": WEBSITE_RETENTION_DAYS,
+        "summary": {"connections": int(summary["connections"]), "targets": int(summary["targets"]),
+                    "ips": int(summary["ips"]), "devices": int(summary["devices"]), "latest": int(summary["latest"])},
+        "topTargets": top_targets, "visits": visits,
+    }
+
+
+def clear_website_history(payload):
+    if not payload.get("confirm"):
+        raise ValueError("需要确认后才能清除访问记录")
+    conn = db()
+    conn.execute("DELETE FROM website_usage")
+    conn.commit()
+    conn.close()
+    audit_command("websites.clear", "all", True, "已清除访问网站历史")
+
+
+def save_log_cursor(inode, offset, conn=None):
+    owns_connection = conn is None
+    if owns_connection: conn = db()
+    conn.execute("INSERT OR REPLACE INTO log_cursor(path,inode,offset,updated_at) VALUES(?,?,?,?)", (LOG_PATH, inode, offset, now()))
+    if owns_connection:
+        conn.commit()
+        conn.close()
+
+
 def tail_log():
     while True:
         try:
             handle = open(LOG_PATH, "r")
             size = os.path.getsize(LOG_PATH)
-            handle.seek(max(0, size - 8 * 1024 * 1024))
-            if size > 8 * 1024 * 1024:
+            initial_end = size
+            inode = os.stat(LOG_PATH).st_ino
+            conn = db()
+            cursor = conn.execute("SELECT inode,offset FROM log_cursor WHERE path=?", (LOG_PATH,)).fetchone()
+            conn.close()
+            resumed = bool(cursor and int(cursor["inode"]) == int(inode) and int(cursor["offset"]) <= size)
+            if resumed:
+                handle.seek(int(cursor["offset"]))
+            else:
+                handle.seek(max(0, size - 8 * 1024 * 1024))
+            if handle.tell() > 0 and not resumed:
                 handle.readline()
+            processed = 0
+            batch_conn = db()
             while True:
                 line = handle.readline()
                 if line:
-                    record_access(line)
+                    record_access(line, batch_conn, handle.tell() > initial_end)
+                    processed += 1
+                    if processed % 250 == 0:
+                        save_log_cursor(inode, handle.tell(), batch_conn)
+                        batch_conn.commit()
                     continue
+                save_log_cursor(inode, handle.tell(), batch_conn)
+                batch_conn.commit()
                 try:
                     if os.path.getsize(LOG_PATH) < handle.tell():
                         handle.close()
+                        batch_conn.close()
                         break
                 except OSError:
                     break
@@ -1206,8 +1343,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.authorized():
             self.send_error(401); return
-        if self.path == "/v1/snapshot": self.send_json(200, snapshot())
-        elif self.path == "/v1/xray/logs": self.send_json(200, read_logs())
+        parsed = urlparse(self.path)
+        if parsed.path == "/v1/snapshot": self.send_json(200, snapshot())
+        elif parsed.path == "/v1/xray/logs": self.send_json(200, read_logs())
+        elif parsed.path == "/v1/websites":
+            try: self.send_json(200, website_report(parse_qs(parsed.query)))
+            except ValueError as error: self.send_json(400, {"error": text_type(error)})
+            except Exception as error: self.send_json(500, {"error": "查询失败：" + text_type(error)[-240:]})
         else: self.send_error(404)
 
     def mutate(self, kind):
@@ -1223,6 +1365,10 @@ class Handler(BaseHTTPRequestHandler):
                 elif kind == "create": create_link(payload)
                 elif kind == "update": update_link(payload)
                 elif kind == "delete": delete_link(payload)
+                elif kind == "websites-clear":
+                    clear_website_history(payload)
+                    self.send_json(200, website_report({}))
+                    return
                 elif kind == "command":
                     result = run_service_action(payload)
                     result["snapshot"] = snapshot()
@@ -1249,6 +1395,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         if self.path == "/v1/links": self.mutate("delete")
+        elif self.path == "/v1/websites": self.mutate("websites-clear")
         else: self.send_error(404)
 
     def log_message(self, fmt, *args):

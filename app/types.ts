@@ -85,3 +85,36 @@ export type MonitorSnapshot = {
   };
   notice: string;
 };
+
+export type WebsiteReport = {
+  generatedAt: number;
+  range: "1h" | "24h" | "7d" | "30d";
+  rangeStart: number;
+  retentionDays: number;
+  summary: { connections: number; targets: number; ips: number; devices: number; latest: number };
+  topTargets: Array<{
+    target: string;
+    port: number;
+    connections: number;
+    unique_ips: number;
+    unique_links: number;
+    last_seen: number;
+    isIp: boolean;
+  }>;
+  visits: Array<{
+    tag: string;
+    linkName: string;
+    ip: string;
+    target: string;
+    port: number;
+    network: "tcp" | "udp";
+    connections: number;
+    first_seen: number;
+    last_seen: number;
+    deviceUuid: string | null;
+    deviceCode: string | null;
+    deviceLabel: string;
+    deviceKey: string;
+    isIp: boolean;
+  }>;
+};

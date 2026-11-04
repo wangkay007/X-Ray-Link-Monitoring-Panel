@@ -62,6 +62,27 @@ flowchart LR
 
 ## 一键部署
 
+### 完全自托管到 Xray 服务器
+
+也可以把网页、登录和采集器全部运行在自己的服务器上，无需 Cloudflare Workers 或 Sites 运行时。需要 Linux、systemd、Docker、Python 3（兼容 Python 2.7 的现有系统）、已安装的 233boy Xray 和 Caddy，以及已解析到服务器的后台域名。
+
+```bash
+git clone https://github.com/wangkay007/X-Ray-Link-Monitoring-Panel.git
+cd X-Ray-Link-Monitoring-Panel
+sudo PANEL_DOMAIN=monitor.example.com \
+     XRAY_PUBLIC_HOST=your-server-ip \
+     ADMIN_USERNAME=admin \
+     bash scripts/deploy-self-hosted.sh
+```
+
+脚本会提示输入后台密码，使用官方 Node.js 22 容器构建独立的 Next.js 服务，安装采集器，并配置 Caddy 自动 HTTPS。容器使用主机网络，但网页只监听 `127.0.0.1:3000`；采集器只监听 `127.0.0.1:8787`，公网不开放 `/v1/*`。容器以非 root 用户、只读文件系统运行。请先按 [Docker 官方说明](https://docs.docker.com/engine/install/) 安装 Docker。
+
+后台凭据保存在服务器 `/etc/xray-panel.env`，权限为 `0600`；不要提交到 GitHub。后续更新执行 `git pull` 并重跑此脚本，会复用登录凭据、采集令牌和本地数据库。新服务器从安装时开始统计，不会自动导入其他服务器的历史用量。
+
+现有 Hysteria2 入站也会被纳入流量、来源 IP、访问目标、额度及到期监控；其创建和编辑暂由 Xray 脚本管理。
+
+### Cloudflare Workers 部署
+
 部署分成两部分：在 Xray 服务器安装采集器，然后把管理面板发布到 Cloudflare Workers。两个脚本都可以重复运行，用于首次安装或后续升级。
 
 ### 前置条件

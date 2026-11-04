@@ -3,6 +3,11 @@
 
 import argparse
 import json
+import io
+import glob
+import hashlib
+import shutil
+import time
 import os
 import stat
 import tempfile
@@ -92,10 +97,9 @@ def atomic_write(path, payload):
         os.fchmod(descriptor, stat.S_IMODE(original.st_mode))
         if hasattr(os, "fchown"):
             os.fchown(descriptor, original.st_uid, original.st_gid)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.replace(temporary, path)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write((json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+        os.rename(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -106,11 +110,28 @@ def main():
     parser.add_argument("config")
     parser.add_argument("--api-port", type=int, default=47495)
     parser.add_argument("--access-log", default="/var/log/xray/access.log")
+    parser.add_argument("--client-config-dir")
     args = parser.parse_args()
 
-    with open(args.config, "r", encoding="utf-8") as handle:
+    with io.open(args.config, "r", encoding="utf-8") as handle:
         config = json.load(handle)
     atomic_write(args.config, patch(config, args.api_port, args.access_log))
+    if args.client_config_dir:
+        for path in glob.glob(os.path.join(args.client_config_dir, "*.json")):
+            with io.open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            changed = False
+            for inbound in payload.get("inbounds", []):
+                if inbound.get("protocol") not in ("vmess", "vless", "trojan"):
+                    continue
+                for client in inbound.get("settings", {}).get("clients", []):
+                    client_id = client.get("id")
+                    if client_id and not client.get("email"):
+                        client["email"] = "device-%s@monitor.local" % hashlib.sha256(client_id.encode("utf-8")).hexdigest()[:20]
+                        changed = True
+            if changed:
+                shutil.copy2(path, path + ".before-monitor-email.%s" % int(time.time()))
+                atomic_write(path, payload)
     print("Xray API and statistics configuration is ready")
 
 

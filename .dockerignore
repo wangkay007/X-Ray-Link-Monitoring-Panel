@@ -1,0 +1,14 @@
+.git
+.env*
+!.env.example
+.openai
+node_modules
+.next
+.vinext
+dist
+.wrangler
+.impeccable
+outputs
+work
+**/__pycache__
+*.tsbuildinfo

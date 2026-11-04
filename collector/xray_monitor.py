@@ -51,6 +51,7 @@ XRAY_ERROR_LOG = os.environ.get("XRAY_ERROR_LOG", "/var/log/xray/error.log")
 WEBSITE_RETENTION_DAYS = max(1, int(os.environ.get("XRAY_WEBSITE_RETENTION_DAYS", "30")))
 
 PROTOCOLS = {
+    "hysteria2": {"label": "Hysteria2", "alias": "hysteria2", "kind": "external"},
     "vless-reality": {"label": "VLESS Reality", "alias": "reality", "kind": "reality"},
     "vmess-tcp": {"label": "VMess TCP", "alias": "tcp", "kind": "direct"},
     "vmess-mkcp": {"label": "VMess mKCP", "alias": "kcp", "kind": "direct"},
@@ -244,6 +245,7 @@ def device_code(client_id):
 
 
 def protocol_id(protocol, network, security):
+    if protocol == "hysteria": return "hysteria2"
     if protocol == "vless" and security == "reality": return "vless-reality"
     if protocol == "vmess" and network == "tcp": return "vmess-tcp"
     if protocol == "vmess" and network == "kcp": return "vmess-mkcp"
@@ -286,7 +288,9 @@ def discover_links():
             static = STATIC_META.get(tag)
             metadata = meta_rows.get(tag)
             name = metadata["name"] if metadata else (static[0] if static else tag.replace(".json", ""))
-            endpoint = SERVER_HOST + ":" + str(port)
+            address = SERVER_HOST
+            if ":" in address and not address.startswith("["): address = "[" + address + "]"
+            endpoint = address + ":" + str(port)
             transport = "direct"
             if static:
                 endpoint, transport = static[1], static[2]
@@ -323,7 +327,7 @@ def discover_links():
             result[tag] = {
                 "id": tag, "name": name, "protocol": protocol_label,
                 "endpoint": endpoint, "transport": transport, "port": port,
-                "managed": True,
+                "managed": PROTOCOLS[protocol_key]["kind"] != "external",
                 "shareUri": metadata.get("share_uri") if metadata else None,
                 "devices": devices,
                 "config": {
@@ -899,6 +903,7 @@ def manager_args(payload):
     if protocol_key not in PROTOCOLS: raise ValueError("不支持该协议")
     definition = PROTOCOLS[protocol_key]
     kind = definition["kind"]
+    if kind == "external": raise ValueError("此协议当前支持监控、额度和到期控制，请通过 Xray 脚本创建或编辑")
     args = [definition["alias"]]
     if kind == "reality":
         port = validate_port(payload.get("port"))
@@ -951,6 +956,17 @@ def xray_files():
 
 
 def extract_share_uri(tag):
+    link = discover_links().get(tag)
+    if link and link["config"]["protocolId"] == "shadowsocks":
+        for inbound in read_json(link["configPath"]).get("inbounds", []):
+            if inbound.get("tag") != tag: continue
+            settings = inbound.get("settings", {})
+            if settings.get("method", "").startswith("2022-"):
+                address = SERVER_HOST
+                if ":" in address and not address.startswith("["): address = "[" + address + "]"
+                return "ss://%s:%s@%s:%s#%s" % (
+                    url_quote(settings["method"], safe=""), url_quote(settings["password"], safe=""),
+                    address, link["port"], url_quote(link["name"].encode("utf-8"), safe=""))
     output = run_xray(["url", tag], timeout=30)
     matches = re.findall(r"(?:vmess|vless|trojan|ss|socks)://[^\s\x1b]+", output)
     return matches[0] if matches else None
@@ -1018,6 +1034,7 @@ def update_link(payload):
     shutil.copy2(link["configPath"], backup)
     config = link["config"]
     kind = PROTOCOLS[config["protocolId"]]["kind"]
+    if kind == "external": raise ValueError("此协议请通过 Xray 脚本编辑")
     current = tag
     if kind in ("direct", "reality", "shadowsocks", "socks") and payload.get("port") is not None:
         port = validate_port(payload.get("port"), current)
@@ -1075,8 +1092,14 @@ def service_status():
     conn = db()
     audit = list(conn.execute("SELECT action,target,success,output,created_at FROM command_audit ORDER BY id DESC LIMIT 12"))
     conn.close()
+    script_version = "233boy"
+    try:
+        with open("/etc/xray/sh/xray.sh") as handle:
+            match = re.search(r"^is_sh_ver=(v[0-9.]+)", handle.read(), re.M)
+            if match: script_version += " " + match.group(1)
+    except IOError: pass
     return {"running": active("xray"), "caddyRunning": active("caddy"), "version": version,
-            "script": "233boy v1.33", "protocols": [dict({"id": key}, **value) for key, value in PROTOCOLS.items()],
+            "script": script_version, "protocols": [dict({"id": key}, **value) for key, value in PROTOCOLS.items() if value["kind"] != "external"],
             "audit": audit}
 
 

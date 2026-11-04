@@ -42,12 +42,19 @@ if [[ ! "${MONITOR_API_DOMAIN}" =~ ^[A-Za-z0-9.-]+$ ]]; then
   echo "MONITOR_API_DOMAIN must contain only a hostname, without https:// or a path." >&2
   exit 1
 fi
-if [[ ! "${XRAY_PUBLIC_HOST}" =~ ^[A-Za-z0-9.:\[\]-]+$ ]]; then
+host_to_validate="${XRAY_PUBLIC_HOST#\[}"
+host_to_validate="${host_to_validate%\]}"
+if [[ ! "${host_to_validate}" =~ ^[A-Za-z0-9.:-]+$ ]]; then
   echo "XRAY_PUBLIC_HOST must be a hostname or IP address." >&2
   exit 1
 fi
 
-for command in python3 systemctl curl openssl install; do
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || command -v python || true)}"
+if [[ -z "${PYTHON_BIN}" ]]; then
+  echo "Python 3 or Python 2.7 is required." >&2
+  exit 1
+fi
+for command in systemctl curl openssl install; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "Missing required command: ${command}" >&2
     exit 1
@@ -118,11 +125,14 @@ fi
 timestamp="$(date +%Y%m%d-%H%M%S)"
 xray_backup="${XRAY_CONFIG}.before-xray-monitor.${timestamp}"
 cp -a "${XRAY_CONFIG}" "${xray_backup}"
+conf_backup="${XRAY_CONF_DIR}.before-xray-monitor.${timestamp}"
+cp -a "${XRAY_CONF_DIR}" "${conf_backup}"
 
-python3 "${ROOT_DIR}/scripts/patch-xray-config.py" \
+"${PYTHON_BIN}" "${ROOT_DIR}/scripts/patch-xray-config.py" \
   "${XRAY_CONFIG}" \
   --api-port "${XRAY_API_PORT}" \
-  --access-log "${XRAY_ACCESS_LOG}"
+  --access-log "${XRAY_ACCESS_LOG}" \
+  --client-config-dir "${XRAY_CONF_DIR}"
 
 test_args=(run -test -config "${XRAY_CONFIG}")
 if [[ -d "${XRAY_CONF_DIR}" ]]; then
@@ -130,6 +140,7 @@ if [[ -d "${XRAY_CONF_DIR}" ]]; then
 fi
 if ! "${XRAY_BIN}" "${test_args[@]}"; then
   cp -a "${xray_backup}" "${XRAY_CONFIG}"
+  cp -a "${conf_backup}/." "${XRAY_CONF_DIR}/"
   echo "Xray validation failed; the original config was restored." >&2
   exit 1
 fi
@@ -137,6 +148,12 @@ fi
 install -d -m 0755 /opt/xray-monitor /var/lib/xray-monitor/backups
 install -m 0755 "${ROOT_DIR}/collector/xray_monitor.py" /opt/xray-monitor/xray_monitor.py
 install -m 0644 "${ROOT_DIR}/collector/xray-monitor.service" /etc/systemd/system/xray-monitor.service
+install -d -m 0755 /etc/systemd/system/xray-monitor.service.d
+cat >/etc/systemd/system/xray-monitor.service.d/python.conf <<EOF
+[Service]
+ExecStart=
+ExecStart=${PYTHON_BIN} /opt/xray-monitor/xray_monitor.py
+EOF
 install -m 0644 "${ROOT_DIR}/collector/xray-logrotate" /etc/logrotate.d/xray-monitor
 
 if [[ -z "${MONITOR_TOKEN:-}" && -f "${ENV_FILE}" ]]; then
@@ -206,6 +223,7 @@ if ! caddy validate --config /etc/caddy/Caddyfile; then
     rm -f "${caddy_site}"
   fi
   cp -a "${xray_backup}" "${XRAY_CONFIG}"
+  cp -a "${conf_backup}/." "${XRAY_CONF_DIR}/"
   echo "Caddy validation failed; Xray and Caddy files were restored." >&2
   exit 1
 fi
@@ -213,6 +231,7 @@ fi
 systemctl daemon-reload
 if ! systemctl restart xray; then
   cp -a "${xray_backup}" "${XRAY_CONFIG}"
+  cp -a "${conf_backup}/." "${XRAY_CONF_DIR}/"
   if [[ -n "${caddy_backup}" ]]; then
     cp -a "${caddy_backup}" "${caddy_site}"
   else
@@ -222,8 +241,9 @@ if ! systemctl restart xray; then
   echo "Xray restart failed; the original config was restored." >&2
   exit 1
 fi
-systemctl enable --now xray-monitor
-if ! systemctl reload caddy; then
+systemctl enable xray-monitor
+systemctl restart xray-monitor
+if ! { systemctl reload caddy || systemctl restart caddy; }; then
   if [[ -n "${caddy_backup}" ]]; then
     cp -a "${caddy_backup}" "${caddy_site}"
   else

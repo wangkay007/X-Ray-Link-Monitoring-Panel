@@ -37,6 +37,22 @@ class WebsiteCollectionTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_discovers_existing_hysteria_and_ss2022_without_exposing_secrets(self):
+        for name, protocol, settings, stream in (
+            ('Hysteria2-39906.json', 'hysteria', {'version': 2}, {'network': 'hysteria', 'security': 'tls'}),
+            ('Shadowsocks-34829.json', 'shadowsocks', {'method': '2022-blake3-aes-256-gcm', 'password': 'private-key'}, {}),
+        ):
+            payload = {'inbounds': [{'tag': name, 'port': 34829, 'protocol': protocol, 'settings': settings, 'streamSettings': stream}]}
+            with open(os.path.join(self.collector.XRAY_CONFIG_DIR, name), 'w') as handle:
+                json.dump(payload, handle)
+        links = self.collector.discover_links()
+        self.assertEqual(links['Hysteria2-39906.json']['protocol'], 'Hysteria2')
+        self.assertFalse(links['Hysteria2-39906.json']['managed'])
+        self.assertEqual(links['Shadowsocks-34829.json']['config']['method'], '2022-blake3-aes-256-gcm')
+        self.assertNotIn('private-key', json.dumps(links))
+        uri = self.collector.extract_share_uri('Shadowsocks-34829.json')
+        self.assertTrue(uri.startswith('ss://2022-blake3-aes-256-gcm:private-key@'))
+
     def test_collects_filters_and_clears_target_domains(self):
         timestamp = time.strftime("%Y/%m/%d %H:%M:%S", time.localtime())
         line = "%s.123456 from 203.0.113.8:0 accepted tcp:chatgpt.com:443 [%s -> direct] email: %s\n" % (

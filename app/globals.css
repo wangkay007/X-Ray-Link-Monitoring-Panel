@@ -344,6 +344,11 @@ h1, h2, p { margin: 0; }
 .form-error { color: var(--danger); }
 .form-success { color: var(--success); }
 .quota-note { margin-top: 8px; line-height: 1.4; }
+.source-limit-editor .quota-heading > div { min-width: 0; }
+.source-limit-editor .quota-heading > div span { overflow-wrap: anywhere; }
+.source-limit-editor .switch-label { flex-shrink: 0; }
+.source-limit-editor .quota-fields { display: grid; grid-template-columns: minmax(0, 1fr); }
+.source-limit-editor button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
 .expiry-editor { background: white; }
 .expiry-editor.expiry-disabled { border-color: oklch(0.82 0.08 28); background: oklch(0.975 0.012 28); }
 .expiry-status { display: grid; gap: 4px; margin-top: 14px; padding: 10px 12px; border-radius: 8px; background: var(--surface); }

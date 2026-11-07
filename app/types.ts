@@ -13,6 +13,8 @@ export type UuidDevice = {
   deviceLabel: string;
   disabled: boolean;
   lastError: string | null;
+  recentIpCount?: number;
+  lastSeen?: number;
 };
 
 export type LinkUsage = {
@@ -35,6 +37,12 @@ export type LinkUsage = {
   };
   disabled: boolean;
   devices: UuidDevice[];
+  activity?: {
+    sourceCount: number;
+    activeUuidCount: number;
+    sources: Array<{ ip: string; lastSeen: number }>;
+  };
+  sourceLimit?: { enabled: boolean; allowedIp: string; supported: boolean };
   uplink: number;
   downlink: number;
   updatedAt: number;
@@ -61,6 +69,7 @@ export type LinkUsage = {
 export type MonitorSnapshot = {
   server: { name: string; host: string; online: boolean; xray: string };
   generatedAt: number;
+  activeSourceCount?: number;
   totals: { uplink: number; downlink: number; traffic: number };
   bandwidth: {
     limitBytes: number;

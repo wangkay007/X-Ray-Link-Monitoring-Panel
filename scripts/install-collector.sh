@@ -68,6 +68,12 @@ XRAY_API_PORT="${XRAY_API_PORT:-47495}"
 XRAY_ACCESS_LOG="${XRAY_ACCESS_LOG:-/var/log/xray/access.log}"
 CADDY_SITES_DIR="${CADDY_SITES_DIR:-/etc/caddy/sites}"
 ENV_FILE="/etc/xray-monitor.env"
+if [[ -z "${XRAY_MONITOR_TRUST_LOOPBACK_WS+x}" && -f "${ENV_FILE}" ]]; then
+  XRAY_MONITOR_TRUST_LOOPBACK_WS="$(sed -n 's/^XRAY_MONITOR_TRUST_LOOPBACK_WS=//p' "${ENV_FILE}" | head -n 1)"
+fi
+XRAY_MONITOR_TRUST_LOOPBACK_WS="${XRAY_MONITOR_TRUST_LOOPBACK_WS:-0}"
+trust_ws_args=()
+if [[ "${XRAY_MONITOR_TRUST_LOOPBACK_WS}" == 1 ]]; then trust_ws_args+=(--trust-loopback-ws); fi
 if [[ -n "${XRAY_MONITOR_INTERFACE:-}" ]]; then
   NETWORK_INTERFACE="${XRAY_MONITOR_INTERFACE}"
 elif command -v ip >/dev/null 2>&1; then
@@ -132,7 +138,7 @@ cp -a "${XRAY_CONF_DIR}" "${conf_backup}"
   "${XRAY_CONFIG}" \
   --api-port "${XRAY_API_PORT}" \
   --access-log "${XRAY_ACCESS_LOG}" \
-  --client-config-dir "${XRAY_CONF_DIR}"
+  --client-config-dir "${XRAY_CONF_DIR}" ${trust_ws_args[@]+"${trust_ws_args[@]}"}
 
 test_args=(run -test -config "${XRAY_CONFIG}")
 if [[ -d "${XRAY_CONF_DIR}" ]]; then
@@ -185,6 +191,7 @@ XRAY_MONITOR_PERIOD_DAYS=${XRAY_MONITOR_PERIOD_DAYS}
 XRAY_MONITOR_RESET_ANCHOR=${XRAY_MONITOR_RESET_ANCHOR}
 XRAY_WEBSITE_RETENTION_DAYS=${XRAY_WEBSITE_RETENTION_DAYS}
 XRAY_MONITOR_STATIC_META=/etc/xray-monitor-static-meta.json
+XRAY_MONITOR_TRUST_LOOPBACK_WS=${XRAY_MONITOR_TRUST_LOOPBACK_WS}
 EOF
 chmod 0600 "${ENV_FILE}"
 

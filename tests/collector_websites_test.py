@@ -1,4 +1,5 @@
 import importlib.util
+import ipaddress
 import json
 import os
 import tempfile
@@ -74,6 +75,43 @@ class WebsiteCollectionTest(unittest.TestCase):
         self.assertFalse(set(item["target"] for item in first_page["visits"]) & set(item["target"] for item in second_page["visits"]))
         self.collector.clear_website_history({"confirm": True})
         self.assertEqual(self.collector.website_report({})["summary"]["connections"], 0)
+
+    def test_recent_activity_deduplicates_sources_and_matches_configured_email(self):
+        collector = self.collector
+        path = os.path.join(collector.XRAY_CONFIG_DIR, self.tag)
+        with open(path) as handle:
+            payload = json.load(handle)
+        payload["inbounds"][0]["settings"]["clients"][0]["email"] = "custom@example.test"
+        with open(path, "w") as handle:
+            json.dump(payload, handle)
+        stamp = time.strftime("%Y/%m/%d %H:%M:%S", time.localtime())
+        for source, outbound in (("tcp:203.0.113.8", "direct"), ("[::ffff:203.0.113.8]", "direct"),
+                                 ("[2001:db8::42]", "direct"), ("203.0.113.9", "block")):
+            collector.record_access("%s.123456 from %s:1234 accepted tcp:example.com:443 [%s >> %s] email: custom@example.test\n" % (stamp, source, self.tag, outbound))
+        report = collector.website_report({"device": [self.uuid]})
+        self.assertEqual(report["summary"]["ips"], 2)
+        self.assertEqual(report["summary"]["devices"], 1)
+        collector.clear_website_history({"confirm": True})
+        conn = collector.db()
+        rows = list(conn.execute("SELECT ip,email,last_seen FROM client_activity WHERE tag=?", (self.tag,)))
+        conn.close()
+        meta = collector.discover_links()[self.tag]
+        devices, activity = collector.link_activity(meta, rows, {}, "")
+        self.assertEqual(activity["sourceCount"], 2)
+        self.assertEqual(activity["activeUuidCount"], 1)
+        self.assertEqual(devices[0]["recentIpCount"], 2)
+        _, limited = collector.link_activity(meta, rows, {}, "203.0.113.8")
+        self.assertEqual(limited["sourceCount"], 1)
+
+    def test_source_limit_covers_both_families_except_bound_address(self):
+        collector = self.collector
+        candidates = ("0.0.0.0", "203.0.113.8", "203.0.113.9", "::", "2001:db8::8", "2001:db8::9")
+        for allowed in ("203.0.113.8", "2001:db8::8"):
+            rule = collector.source_limit_rule(self.tag, allowed)
+            networks = [ipaddress.ip_network(value) for value in rule["source"]]
+            self.assertEqual(collector.configured_source_limits({"routing": {"rules": [rule]}}), {self.tag: allowed})
+            for candidate in candidates:
+                self.assertEqual(any(ipaddress.ip_address(candidate) in net for net in networks), candidate != allowed)
 
 
 if __name__ == "__main__":

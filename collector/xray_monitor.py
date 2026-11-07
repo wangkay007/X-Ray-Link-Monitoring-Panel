@@ -49,6 +49,9 @@ SERVER_RESET_ANCHOR = os.environ.get("XRAY_MONITOR_RESET_ANCHOR", "1970-01-01")
 BACKUP_DIR = os.environ.get("XRAY_MONITOR_BACKUPS", "/var/lib/xray-monitor/backups")
 XRAY_ERROR_LOG = os.environ.get("XRAY_ERROR_LOG", "/var/log/xray/error.log")
 WEBSITE_RETENTION_DAYS = max(1, int(os.environ.get("XRAY_WEBSITE_RETENTION_DAYS", "30")))
+ACTIVITY_WINDOW = 300
+SOURCE_LIMIT_PREFIX = "monitor-one-source-"
+TRUST_LOOPBACK_WS = os.environ.get("XRAY_MONITOR_TRUST_LOOPBACK_WS") == "1"
 
 PROTOCOLS = {
     "hysteria2": {"label": "Hysteria2", "alias": "hysteria2", "kind": "external"},
@@ -95,7 +98,7 @@ def load_static_meta():
 
 STATIC_META = load_static_meta()
 
-ACCESS_RE = re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+ from (\[[^\]]+\]|[^: ]+):\d+ accepted (tcp|udp):(.+):(\d+) \[([^ ]+) (?:->|>>) [^\]]+\](?: email: ([^ ]+))?")
+ACCESS_RE = re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+ from (?:tcp:|udp:)?(\[[^\]]+\]|[^: ]+):\d+ accepted (tcp|udp):(.+):(\d+) \[([^ ]+) (?:->|>>) ([^\]]+)\](?: email: ([^ ]+))?")
 STAT_RE = re.compile(r'^inbound>>>(.+)>>>traffic>>>(uplink|downlink)$')
 DOMAIN_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
 MUTATION_LOCK = threading.Lock()
@@ -181,11 +184,17 @@ def init_db():
     CREATE INDEX IF NOT EXISTS website_usage_last_idx ON website_usage(last_seen DESC);
     CREATE INDEX IF NOT EXISTS website_usage_target_idx ON website_usage(target, last_seen DESC);
     CREATE INDEX IF NOT EXISTS website_usage_tag_idx ON website_usage(tag, last_seen DESC);
+    CREATE TABLE IF NOT EXISTS client_activity (
+      tag TEXT NOT NULL, ip TEXT NOT NULL, email TEXT NOT NULL DEFAULT '',
+      last_seen INTEGER NOT NULL, PRIMARY KEY(tag, ip, email)
+    );
+    CREATE INDEX IF NOT EXISTS client_activity_last_idx ON client_activity(last_seen);
     CREATE TABLE IF NOT EXISTS log_cursor (
       path TEXT PRIMARY KEY, inode INTEGER NOT NULL DEFAULT 0,
       offset INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0
     );
     """)
+    conn.execute("INSERT OR IGNORE INTO client_activity(tag,ip,email,last_seen) SELECT tag,ip,email,MAX(last_seen) FROM website_usage WHERE last_seen>=? GROUP BY tag,ip,email", (now() - ACTIVITY_WINDOW,))
     migrate_server_traffic(conn)
     conn.commit()
     conn.close()
@@ -229,6 +238,22 @@ def valid_ip(address):
         return True
     except Exception:
         return False
+
+
+def normalize_ip(address):
+    address = address.strip().strip("[]")
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
+    try:
+        packed = socket.inet_pton(family, address)
+        if family == socket.AF_INET6 and packed[:12] == b"\x00" * 10 + b"\xff\xff":
+            family, packed = socket.AF_INET, packed[12:]
+        return socket.inet_ntop(family, packed)
+    except (ValueError, socket.error):
+        return ""
+
+
+def usable_client_ip(address):
+    return bool(address and address not in ("::", "::1", "0.0.0.0", SERVER_HOST) and not address.startswith("127.") and not is_cloudflare_ip(address))
 
 
 def read_json(path):
@@ -278,7 +303,8 @@ def discover_links():
             if not tag:
                 continue
             stream = inbound.get("streamSettings", {})
-            network = stream.get("network", "tcp")
+            network = stream.get("method") or stream.get("network") or "tcp"
+            network = {"websocket": "ws", "raw": "tcp", "mkcp": "kcp"}.get(network, network)
             security = stream.get("security")
             protocol_key = protocol_id(protocol, network, security)
             if not protocol_key:
@@ -302,11 +328,12 @@ def discover_links():
                 if isinstance(xhttp_host, list): xhttp_host = xhttp_host[0] if xhttp_host else None
                 endpoint = headers.get("Host") or headers.get("host") or stream.get("grpc_host") or xhttp_host or endpoint
                 transport = "cdn"
-            devices = []
+            devices, device_emails = [], {}
             for client in inbound.get("settings", {}).get("clients", []):
                 client_id = client.get("id")
                 if not client_id:
                     continue
+                device_emails[client_id] = client.get("email") or device_email(client_id)
                 control = uuid_rows.get((tag, client_id), {})
                 devices.append({
                     "uuid": client_id,
@@ -330,6 +357,12 @@ def discover_links():
                 "managed": PROTOCOLS[protocol_key]["kind"] != "external",
                 "shareUri": metadata.get("share_uri") if metadata else None,
                 "devices": devices,
+                "deviceEmails": device_emails,
+                "sourceLimitSupported": (
+                    PROTOCOLS[protocol_key]["kind"] != "tls" or
+                    (TRUST_LOOPBACK_WS and network == "ws" and inbound.get("listen") in ("127.0.0.1", "::1")
+                     and "X-Forwarded-For" in stream.get("sockopt", {}).get("trustedXForwardedFor", []))
+                ),
                 "config": {
                     "protocolId": protocol_key, "host": host, "path": path_value,
                     "sni": (reality.get("serverNames") or [""])[0],
@@ -466,6 +499,7 @@ def update_stats():
         conn.execute("UPDATE samples SET up_bytes=up_bytes+?,down_bytes=down_bytes+? WHERE bucket=? AND tag=?",
                      (max(0, delta_up), max(0, delta_down), bucket, tag))
     conn.execute("DELETE FROM samples WHERE bucket < ?", (stamp - 30 * 86400,))
+    conn.execute("DELETE FROM client_activity WHERE last_seen < ?", (stamp - 86400,))
     conn.commit()
     conn.close()
     enforce_quotas()
@@ -674,6 +708,119 @@ def save_ip_control(payload):
     apply_block_rules()
 
 
+def other_source_ranges(address):
+    """CIDRs covering every IPv4/IPv6 address except the selected host."""
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
+    packed = socket.inet_pton(family, address)
+    bits = len(packed) * 8
+    value = int(binascii.hexlify(packed), 16)
+    ranges = ["0.0.0.0/0" if family == socket.AF_INET6 else "::/0"]
+    for prefix in range(1, bits + 1):
+        shift = bits - prefix
+        sibling = ((value >> shift) ^ 1) << shift
+        network = socket.inet_ntop(family, binascii.unhexlify("%0*x" % (len(packed) * 2, sibling)))
+        ranges.append("%s/%s" % (network, prefix))
+    return ranges
+
+
+def source_limit_rule(tag, address):
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
+    hex_ip = binascii.hexlify(socket.inet_pton(family, address)).decode("ascii")
+    rule_id = hashlib.sha256(tag.encode("utf-8")).hexdigest()[:16]
+    return {"type": "field", "inboundTag": [tag], "source": other_source_ranges(address),
+            "outboundTag": "block", "ruleTag": SOURCE_LIMIT_PREFIX + rule_id + "-" + hex_ip}
+
+
+def configured_source_limits(config):
+    limits = {}
+    for rule in config.get("routing", {}).get("rules", []):
+        rule_tag = rule.get("ruleTag", "")
+        tags = rule.get("inboundTag", [])
+        if not rule_tag.startswith(SOURCE_LIMIT_PREFIX) or len(tags) != 1:
+            continue
+        try:
+            packed = binascii.unhexlify(rule_tag.rsplit("-", 1)[1])
+            address = socket.inet_ntop(socket.AF_INET6 if len(packed) == 16 else socket.AF_INET, packed)
+            if rule == source_limit_rule(tags[0], address): limits[tags[0]] = address
+        except (ValueError, TypeError, socket.error):
+            continue
+    return limits
+
+
+def read_source_limits():
+    try: return configured_source_limits(read_json(XRAY_MAIN_CONFIG))
+    except (IOError, ValueError): return {}
+
+
+def require_unbound(tag):
+    if tag in read_source_limits():
+        raise ValueError("请先关闭此链接的单设备限制，再修改或删除配置")
+
+
+def restore_runtime_controls():
+    conn = db()
+    blocked = conn.execute("SELECT 1 FROM ip_controls WHERE blocked=1 LIMIT 1").fetchone()
+    conn.close()
+    if blocked: apply_block_rules()
+    enforce_quotas()
+    enforce_expirations()
+    apply_uuid_controls()
+
+
+def save_source_limit(payload):
+    tag = (payload.get("tag") or "").strip()
+    enabled = payload.get("enabled")
+    link = discover_links().get(tag)
+    if not link: raise ValueError("找不到该 Xray 链接")
+    if not isinstance(enabled, bool): raise ValueError("请选择是否启用限制")
+    if enabled and not link["sourceLimitSupported"]: raise ValueError("此传输暂不支持绑定来源 IP")
+    address = normalize_ip(payload.get("allowedIp") or "") if enabled else ""
+    if enabled and not usable_client_ip(address):
+        raise ValueError("请输入设备实际使用的来源 IP，不能使用本机或 CDN 边缘地址")
+    config = read_json(XRAY_MAIN_CONFIG)
+    if configured_source_limits(config).get(tag, "") == address: return
+    if not any(item.get("tag") == "block" and item.get("protocol") == "blackhole" for item in config.get("outbounds", [])):
+        raise ValueError("Xray 缺少 block 出站，无法应用限制")
+    routing = config.setdefault("routing", {})
+    if routing.get("script") or any(read_json(p).get("routing") for p in glob.glob(os.path.join(XRAY_CONFIG_DIR, "*.json"))):
+        raise ValueError("当前路由由脚本或分文件管理，无法安全应用限制")
+    rules = [rule for rule in routing.get("rules", []) if not (
+        rule.get("ruleTag", "").startswith(SOURCE_LIMIT_PREFIX) and rule.get("inboundTag") == [tag])]
+    routing["rules"] = ([source_limit_rule(tag, address)] if enabled else []) + rules
+    backup = os.path.join(BACKUP_DIR, "main.before-source-limit.%s.%s" % (now(), os.getpid()))
+    original = os.stat(XRAY_MAIN_CONFIG)
+    with open(XRAY_MAIN_CONFIG, "rb") as handle: previous = handle.read()
+
+    def stage(data):
+        fd, filename = tempfile.mkstemp(prefix=".monitor-routing-", suffix=".json", dir=os.path.dirname(XRAY_MAIN_CONFIG))
+        with os.fdopen(fd, "wb") as handle:
+            os.fchmod(handle.fileno(), original.st_mode & 0o777)
+            os.fchown(handle.fileno(), original.st_uid, original.st_gid)
+            handle.write(data)
+        return filename
+
+    candidate = stage((json.dumps(config, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+    changed = False
+    try:
+        run_process([XRAY, "run", "-test", "-config", candidate, "-confdir", XRAY_CONFIG_DIR], 30)
+        shutil.copy2(XRAY_MAIN_CONFIG, backup)
+        os.chmod(backup, 0o600)
+        os.rename(candidate, XRAY_MAIN_CONFIG)
+        changed = True
+        run_process(["systemctl", "restart", "xray"], 30)
+        run_process(["systemctl", "is-active", "xray"], 10)
+        restore_runtime_controls()
+    except Exception:
+        if changed:
+            os.rename(stage(previous), XRAY_MAIN_CONFIG)
+            run_process(["systemctl", "restart", "xray"], 30)
+            restore_runtime_controls()
+        raise
+    finally:
+        if os.path.exists(candidate): os.unlink(candidate)
+    audit_command("source-limit.save", tag, True, "已绑定单一来源" if enabled else "已解除来源限制")
+
+
 def find_uuid_client(tag, client_id):
     link = discover_links().get(tag)
     if not link:
@@ -765,11 +912,11 @@ def record_access(line, conn=None, record_ip=True):
     match = ACCESS_RE.match(line)
     if not match:
         return
-    date_text, address, network, target, target_port, tag, email = match.groups()
+    date_text, address, network, target, target_port, tag, outbound, email = match.groups()
     if os.path.basename(tag) != tag or not os.path.isfile(os.path.join(XRAY_CONFIG_DIR, tag)):
         return
-    address = address.strip("[]")
-    if is_cloudflare_ip(address):
+    address = normalize_ip(address)
+    if not address or is_cloudflare_ip(address) or outbound == "block":
         return
     target = target.strip("[]").strip().lower()
     if len(target) > 253 or not (valid_ip(target) or (DOMAIN_RE.match(target) and ".." not in target)):
@@ -785,6 +932,8 @@ def record_access(line, conn=None, record_ip=True):
         stamp = now()
     owns_connection = conn is None
     if owns_connection: conn = db()
+    conn.execute("INSERT OR IGNORE INTO client_activity(tag,ip,email,last_seen) VALUES(?,?,?,?)", (tag, address, email, stamp))
+    conn.execute("UPDATE client_activity SET last_seen=MAX(last_seen,?) WHERE tag=? AND ip=? AND email=?", (stamp, tag, address, email))
     if record_ip:
         row = conn.execute("SELECT connections FROM ip_usage WHERE tag=? AND ip=?", (tag, address)).fetchone()
         if row:
@@ -951,6 +1100,44 @@ def atomic_write_json(path, payload):
             os.unlink(temporary)
 
 
+def ensure_ws_source_tracking(paths):
+    """Only trust sanitized XFF on loopback listeners behind the owner's proxy."""
+    if not TRUST_LOOPBACK_WS: return 0
+    backups = []
+    restarted = False
+    try:
+        for path in paths:
+            config = read_json(path)
+            changed = False
+            for inbound in config.get("inbounds", []):
+                stream = inbound.get("streamSettings", {})
+                if (stream.get("method") or stream.get("network")) not in ("ws", "websocket") or inbound.get("listen") not in ("127.0.0.1", "::1"):
+                    continue
+                sockopt = stream.setdefault("sockopt", {})
+                if not sockopt.get("trustedXForwardedFor"):
+                    sockopt["trustedXForwardedFor"] = ["X-Forwarded-For"]
+                    changed = True
+            if not changed: continue
+            backup = os.path.join(BACKUP_DIR, os.path.basename(path) + ".before-source-tracking.%s" % now())
+            shutil.copy2(path, backup)
+            os.chmod(backup, 0o600)
+            backups.append((path, backup))
+            atomic_write_json(path, config)
+        if backups:
+            test_all_configs()
+            restarted = True
+            run_process(["systemctl", "restart", "xray"], 30)
+            run_process(["systemctl", "is-active", "xray"], 10)
+            restore_runtime_controls()
+    except Exception:
+        for path, backup in backups: shutil.copy2(backup, path)
+        if restarted:
+            run_process(["systemctl", "restart", "xray"], 30)
+            restore_runtime_controls()
+        raise
+    return len(backups)
+
+
 def xray_files():
     return set(os.path.basename(path) for path in glob.glob(os.path.join(XRAY_CONFIG_DIR, "*.json")) if "-link.json" not in path)
 
@@ -990,6 +1177,7 @@ def create_link(payload):
     if len(created) != 1:
         raise RuntimeError("配置已创建，但无法唯一识别新链接；请刷新后检查")
     tag = created[0]
+    ensure_ws_source_tracking([os.path.join(XRAY_CONFIG_DIR, tag)])
     uri = extract_share_uri(tag)
     save_link_meta(tag, name, uri)
     apply_block_rules()
@@ -999,7 +1187,7 @@ def create_link(payload):
 def migrate_tag(old_tag, new_tag):
     if old_tag == new_tag: return
     conn = db()
-    for table in ("counters", "ip_usage", "samples", "quotas", "expirations", "uuid_controls", "website_usage"):
+    for table in ("counters", "ip_usage", "samples", "quotas", "expirations", "uuid_controls", "website_usage", "client_activity"):
         try: conn.execute("UPDATE OR IGNORE %s SET tag=? WHERE tag=?" % table, (new_tag, old_tag))
         except sqlite3.Error: pass
     conn.execute("UPDATE OR REPLACE link_meta SET tag=? WHERE tag=?", (new_tag, old_tag))
@@ -1028,6 +1216,7 @@ def update_link(payload):
     tag = (payload.get("tag") or "").strip()
     links = discover_links()
     if tag not in links: raise ValueError("找不到该 Xray 链接")
+    require_unbound(tag)
     link = links[tag]
     name = validate_name(payload.get("name"))
     backup = os.path.join(BACKUP_DIR, "%s.before-edit.%s" % (tag, now()))
@@ -1058,6 +1247,7 @@ def update_link(payload):
             current = run_link_change(current, "uuid", credential)
         elif kind in ("shadowsocks", "socks"):
             current = run_link_change(current, "passwd", validate_secret(credential))
+    ensure_ws_source_tracking([os.path.join(XRAY_CONFIG_DIR, current)])
     uri = extract_share_uri(current)
     save_link_meta(current, name, uri)
     apply_block_rules()
@@ -1068,6 +1258,7 @@ def delete_link(payload):
     tag = (payload.get("tag") or "").strip()
     links = discover_links()
     if tag not in links: raise ValueError("找不到该 Xray 链接")
+    require_unbound(tag)
     backup = os.path.join(BACKUP_DIR, "%s.before-delete.%s" % (tag, now()))
     shutil.copy2(links[tag]["configPath"], backup)
     try:
@@ -1076,7 +1267,7 @@ def delete_link(payload):
         if os.path.exists(links[tag]["configPath"]): raise
         audit_command("link.delete.confirmed", tag, True, "脚本已删除配置；忽略其非零退出码")
     conn = db()
-    for table in ("link_meta", "quotas", "expirations", "uuid_controls"):
+    for table in ("link_meta", "quotas", "expirations", "uuid_controls", "client_activity"):
         conn.execute("DELETE FROM %s WHERE tag=?" % table, (tag,))
     conn.commit()
     conn.close()
@@ -1113,6 +1304,8 @@ def run_service_action(payload):
         audit_command("link.url", tag, True, "已生成分享链接")
         return {"output": uri, "shareUri": uri}
     if action not in SERVICE_ACTIONS: raise ValueError("不允许执行该命令")
+    if action in ("fix-all", "fix-config") and read_source_limits():
+        raise ValueError("重建主配置前，请先关闭已启用的单设备限制")
     if action == "test":
         test_all_configs()
         output = "全部 Xray 配置测试通过"
@@ -1168,7 +1361,10 @@ def website_report(params):
     device = (params.get("device") or [""])[0].strip().lower()
     if device:
         if not UUID_RE.match(device): raise ValueError("设备 UUID 格式不正确")
-        conditions.append("email=?"); values.append(device_email(device))
+        matches = [(link_tag, email) for link_tag, link in links.items()
+                   for client_id, email in link["deviceEmails"].items() if client_id.lower() == device]
+        conditions.append("(" + " OR ".join("(tag=? AND email=?)" for _ in matches) + ")" if matches else "0")
+        for match in matches: values.extend(match)
     keyword = (params.get("q") or [""])[0].strip().lower()
     if keyword:
         if len(keyword) > 80: raise ValueError("搜索内容过长")
@@ -1176,7 +1372,8 @@ def website_report(params):
         values.append("%" + keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
     where = " AND ".join(conditions)
     conn = db()
-    summary = conn.execute("SELECT COALESCE(SUM(connections),0) AS connections,COUNT(DISTINCT target) AS targets,COUNT(DISTINCT ip) AS ips,COUNT(DISTINCT CASE WHEN email!='' THEN email END) AS devices,COALESCE(MAX(last_seen),0) AS latest FROM website_usage WHERE " + where, values).fetchone()
+    summary = conn.execute("SELECT COALESCE(SUM(connections),0) AS connections,COUNT(DISTINCT target) AS targets,COUNT(DISTINCT ip) AS ips,COALESCE(MAX(last_seen),0) AS latest FROM website_usage WHERE " + where, values).fetchone()
+    seen_users = list(conn.execute("SELECT DISTINCT tag,email FROM website_usage WHERE " + where + " AND email!=''", values))
     top_rows = list(conn.execute("SELECT target,port,SUM(connections) AS connections,COUNT(DISTINCT ip) AS unique_ips,COUNT(DISTINCT tag) AS unique_links,MAX(last_seen) AS last_seen FROM website_usage WHERE " + where + " GROUP BY target,port ORDER BY connections DESC,last_seen DESC LIMIT 12", values))
     total_items = int(conn.execute("SELECT COUNT(*) AS total FROM (SELECT 1 FROM website_usage WHERE " + where + " GROUP BY tag,ip,target,port,network,email)", values).fetchone()["total"])
     total_pages = (total_items + page_size - 1) // page_size
@@ -1188,7 +1385,9 @@ def website_report(params):
     device_map = {}
     for link_tag, link in links.items():
         for item in link.get("devices", []):
-            device_map[(link_tag, device_email(item["uuid"]))] = item
+            device_map[(link_tag, link["deviceEmails"][item["uuid"]])] = item
+    matched_uuids = set(device_map[(item["tag"], item["email"])]["uuid"] for item in seen_users
+                        if (item["tag"], item["email"]) in device_map)
     top_targets = []
     for row in top_rows:
         item = dict(row)
@@ -1210,7 +1409,7 @@ def website_report(params):
         "generatedAt": stamp, "range": range_key, "rangeStart": start,
         "retentionDays": WEBSITE_RETENTION_DAYS,
         "summary": {"connections": int(summary["connections"]), "targets": int(summary["targets"]),
-                    "ips": int(summary["ips"]), "devices": int(summary["devices"]), "latest": int(summary["latest"])},
+                    "ips": int(summary["ips"]), "devices": len(matched_uuids), "latest": int(summary["latest"])},
         "pagination": {"page": page, "pageSize": page_size, "totalItems": total_items, "totalPages": total_pages},
         "topTargets": top_targets, "visits": visits,
     }
@@ -1280,10 +1479,32 @@ def tail_log():
 def stats_loop():
     while True:
         try:
-            update_stats()
+            with MUTATION_LOCK:
+                update_stats()
         except Exception:
             pass
         time.sleep(30)
+
+
+def link_activity(meta, rows, controls, allowed_ip):
+    sources, by_email = {}, {}
+    for row in rows:
+        ip = normalize_ip(row["ip"])
+        if not usable_client_ip(ip) or controls.get(ip, {}).get("blocked") or (allowed_ip and ip != allowed_ip):
+            continue
+        stamp = int(row["last_seen"])
+        sources[ip] = max(stamp, sources.get(ip, 0))
+        source_times = by_email.setdefault(row["email"], {})
+        source_times[ip] = max(stamp, source_times.get(ip, 0))
+    devices = []
+    for device in meta["devices"]:
+        recent = by_email.get(meta["deviceEmails"][device["uuid"]], {}) if not device["disabled"] else {}
+        devices.append(dict(device, recentIpCount=len(recent), lastSeen=max(recent.values()) if recent else 0))
+    return devices, {
+        "sourceCount": len(sources),
+        "activeUuidCount": sum(bool(device["recentIpCount"]) for device in devices),
+        "sources": [{"ip": ip, "lastSeen": stamp} for ip, stamp in sorted(sources.items(), key=lambda item: -item[1])],
+    }
 
 
 def snapshot():
@@ -1294,7 +1515,11 @@ def snapshot():
     quota_rows = {r["tag"]: r for r in conn.execute("SELECT * FROM quotas")}
     expiration_rows = {r["tag"]: r for r in conn.execute("SELECT * FROM expirations")}
     controls = {r["ip"]: r for r in conn.execute("SELECT * FROM ip_controls")}
-    links, total_up, total_down = [], 0, 0
+    source_limits = read_source_limits()
+    activity_by_tag = {}
+    for item in conn.execute("SELECT tag,ip,email,last_seen FROM client_activity WHERE last_seen>=?", (stamp - ACTIVITY_WINDOW,)):
+        activity_by_tag.setdefault(item["tag"], []).append(item)
+    links, total_up, total_down, active_sources = [], 0, 0, set()
     for tag, meta in links_meta.items():
         row = counter_rows.get(tag)
         up, down = (int(row["total_up"]), int(row["total_down"])) if row else (0, 0)
@@ -1302,6 +1527,7 @@ def snapshot():
         total_down += down
         ips = []
         for item in conn.execute("SELECT ip,first_seen,last_seen,connections FROM ip_usage WHERE tag=? ORDER BY last_seen DESC LIMIT 40", (tag,)):
+            if not usable_client_ip(normalize_ip(item["ip"])): continue
             control = controls.get(item["ip"], {})
             item = dict(item)
             item.update({"deviceLabel": control.get("device_label") or "", "blocked": bool(control.get("blocked"))})
@@ -1323,12 +1549,20 @@ def snapshot():
                           "disabled": bool(expiration_row["disabled"]), "lastError": expiration_row.get("last_error")}
         public_meta = dict(meta)
         public_meta.pop("configPath", None)
+        public_meta.pop("deviceEmails", None)
+        disabled = bool((quota and quota["disabled"]) or (expiration and expiration["disabled"]))
+        allowed_ip = source_limits.get(tag, "")
+        devices, activity = link_activity(meta, [] if disabled else activity_by_tag.get(tag, []), controls, allowed_ip)
+        active_sources.update(item["ip"] for item in activity["sources"])
+        activity["sources"] = activity["sources"][:40]
         public_meta.update({"uplink": up, "downlink": down, "updatedAt": int(row["updated_at"]) if row else 0,
                             "ips": ips, "quota": quota, "expiration": expiration,
-                            "disabled": bool((quota and quota["disabled"]) or (expiration and expiration["disabled"]))})
+                            "disabled": disabled, "devices": devices, "activity": activity,
+                            "sourceLimit": {"enabled": bool(allowed_ip), "allowedIp": allowed_ip, "supported": meta["sourceLimitSupported"]}})
         links.append(public_meta)
     recent = []
     for row in conn.execute("SELECT tag,ip,first_seen,last_seen,connections FROM ip_usage ORDER BY last_seen DESC LIMIT 80"):
+        if not usable_client_ip(normalize_ip(row["ip"])): continue
         item = dict(row)
         control = controls.get(item["ip"], {})
         item.update({"linkName": links_meta.get(item["tag"], {}).get("name", "Unknown"),
@@ -1345,13 +1579,13 @@ def snapshot():
     manager = service_status()
     return {
         "server": {"name": "狗云", "host": SERVER_HOST, "online": manager["running"], "xray": manager["version"]},
-        "generatedAt": stamp,
+        "generatedAt": stamp, "activeSourceCount": len(active_sources),
         "totals": {"uplink": total_up, "downlink": total_down, "traffic": total_up + total_down},
         "bandwidth": {"limitBytes": SERVER_LIMIT_BYTES, "usedBytes": used, "remainingBytes": max(0, SERVER_LIMIT_BYTES - used),
                       "periodStart": period_start, "nextReset": next_reset, "measuredSince": int(traffic["measured_since"]) if traffic else stamp,
                       "periodDays": SERVER_PERIOD_DAYS, "source": "local"},
         "links": links, "recentIps": recent, "series": buckets, "xrayManager": manager,
-        "notice": "链接流量由 Xray 精确统计；来源 IP 来自连接日志。Xray 不会上报设备型号，可为 IP 添加设备备注并按备注批量封禁。服务器流量按 30 天账单周期统计，本机网卡口径可能与云厂商账单略有差异。",
+        "notice": "链接流量来自 Xray 统计；活跃来源和 UUID 来自最近 5 分钟接受的代理请求，不代表物理设备或实时在线数量。同一公网 IP 或 UUID 可被多台设备共用。本机网卡流量与云厂商账单可能略有差异。",
     }
 
 
@@ -1397,6 +1631,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif kind == "expiration": save_expiration(payload)
                 elif kind == "ip": save_ip_control(payload)
                 elif kind == "uuid": save_uuid_control(payload)
+                elif kind == "source-limit": save_source_limit(payload)
                 elif kind == "create": create_link(payload)
                 elif kind == "update": update_link(payload)
                 elif kind == "delete": delete_link(payload)
@@ -1420,6 +1655,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/v1/expirations": self.mutate("expiration")
         elif self.path == "/v1/ips": self.mutate("ip")
         elif self.path == "/v1/uuids": self.mutate("uuid")
+        elif self.path == "/v1/source-limit": self.mutate("source-limit")
         elif self.path == "/v1/links": self.mutate("create")
         elif self.path == "/v1/xray/commands": self.mutate("command")
         else: self.send_error(404)

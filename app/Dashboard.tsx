@@ -88,17 +88,16 @@ function LinkRow({
 }) {
   const total = link.uplink + link.downlink;
   const width = Math.max(total > 0 ? 4 : 0, (total / Math.max(1, maxTraffic)) * 100);
-  const activeIp = link.ips.find((ip) => now - ip.last_seen < 300);
-  const deviceCount = link.devices?.length ?? 0;
+  const activeSources = link.activity?.sourceCount ?? link.ips.filter((ip) => !ip.blocked && now - ip.last_seen < 300).length;
   const disabled = link.disabled;
   const disabledReason = link.expiration?.disabled ? "已到期并停用" : link.quota?.disabled ? "已达到额度并停用" : "";
   return (
     <button className={`link-row ${selected ? "selected" : ""} ${disabled ? "disabled-link" : ""}`} onClick={onSelect} type="button">
       <span className="link-identity">
-        <span className={`status-dot ${disabled ? "stopped" : activeIp ? "live" : ""}`} aria-hidden="true" />
+        <span className={`status-dot ${disabled ? "stopped" : activeSources ? "live" : ""}`} aria-hidden="true" />
         <span>
           <strong>{link.name}</strong>
-          <small>{disabled ? disabledReason : link.protocol}</small>
+          <small>{disabled ? disabledReason : `${link.protocol}${link.sourceLimit?.enabled ? " · 已绑定来源" : ""}`}</small>
         </span>
       </span>
       <span className="endpoint">{link.endpoint}</span>
@@ -107,8 +106,8 @@ function LinkRow({
         <span style={{ width: `${width}%` }} />
       </span>
       <span className={`ip-count ${disabled ? "danger-text" : ""}`}>
-        <b>{deviceCount} UUID</b>
-        <small>{disabled ? "已停用" : `${link.ips.length} IP`}</small>
+        <b>{disabled ? "已停用" : `${activeSources} 来源 IP`}</b>
+        <small>{link.devices.length ? `${link.activity?.activeUuidCount ?? 0}/${link.devices.length} UUID 活跃` : "无 UUID"}</small>
       </span>
     </button>
   );
@@ -298,10 +297,10 @@ function UuidDeviceRow({ device, tag, onSaved }: {
   return (
     <div className={`uuid-device ${device.disabled ? "uuid-disabled" : ""}`}>
       <div className="uuid-device-head">
-        <span className={`status-dot ${device.disabled ? "stopped" : "live"}`} aria-hidden="true" />
+        <span className={`status-dot ${device.disabled ? "stopped" : device.recentIpCount ? "live" : ""}`} aria-hidden="true" />
         <div>
           <strong>{device.deviceLabel || device.code}</strong>
-          <small>{device.disabled ? "UUID 已禁用" : "UUID 可用"}</small>
+          <small>{device.disabled ? "已禁用" : device.recentIpCount ? `近 5 分钟 · ${device.recentIpCount} 来源 IP` : "近 5 分钟无活动"}</small>
         </div>
         <button type="button" onClick={() => navigator.clipboard.writeText(device.uuid)}>复制 UUID</button>
         <button type="button" onClick={() => setEditing((value) => !value)}>{editing ? "收起" : "管理"}</button>
@@ -324,21 +323,79 @@ function UuidDeviceRow({ device, tag, onSaved }: {
 function UuidDevices({ link, onSaved }: { link: LinkUsage; onSaved: (data: MonitorSnapshot) => void }) {
   const devices = link.devices ?? [];
   return (
-    <section className="uuid-devices" aria-label="UUID 设备">
+    <section className="uuid-devices" aria-label="UUID 凭据">
       <div className="uuid-title">
-        <div><strong>UUID 设备</strong><span>展示此链接配置中的全部设备 UUID</span></div>
-        <b>{devices.length} 个</b>
+        <div><strong>UUID 凭据</strong><span>同一个 UUID 可以被多台设备共用</span></div>
+        <b>{link.activity?.activeUuidCount ?? 0}/{devices.length} 活跃</b>
       </div>
       {devices.length ? devices.map((device) => (
         <UuidDeviceRow key={`${link.id}-${device.uuid}`} device={device} tag={link.id} onSaved={onSaved} />
       )) : (
         <div className="uuid-empty">
-          <strong>此链接暂未读取到 UUID</strong>
-          <span>在 Xray 的 clients 中加入设备后会自动显示。</span>
+          <strong>此链接没有 UUID 凭据</strong>
+          <span>仍可通过来源 IP 查看近期连接。</span>
         </div>
       )}
       <p>禁用后不能新建连接；已建立的长连接可能需要短时间才会断开。</p>
     </section>
+  );
+}
+
+function SourceLimitEditor({ link, onSaved }: { link: LinkUsage; onSaved: (data: MonitorSnapshot) => void }) {
+  const [enabled, setEnabled] = useState(link.sourceLimit?.enabled ?? false);
+  const [allowedIp, setAllowedIp] = useState(link.sourceLimit?.allowedIp ?? "");
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState("");
+  const [failed, setFailed] = useState(false);
+  const choices = link.activity?.sources ?? [];
+  const changed = enabled !== link.sourceLimit?.enabled || (enabled && allowedIp.trim() !== link.sourceLimit?.allowedIp);
+  if (!link.sourceLimit?.supported) return null;
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!window.confirm("保存会短暂重启 Xray，现有代理连接可能需要重连。确定保存吗？")) return;
+    setSaving(true);
+    setMessage("");
+    setFailed(false);
+    try {
+      const response = await fetch("/api/source-limit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tag: link.id, enabled, allowedIp: allowedIp.trim() }),
+      });
+      const data = await response.json();
+      if (response.status === 401) return window.location.assign("/login");
+      if (!response.ok) throw new Error(data.error || "保存限制失败");
+      const saved = (data as MonitorSnapshot).links.find((item) => item.id === link.id)?.sourceLimit;
+      setAllowedIp(saved?.allowedIp ?? "");
+      onSaved(data);
+      setMessage(enabled ? "已绑定来源 IP" : "已解除限制");
+    } catch (error) {
+      setFailed(true);
+      setMessage(error instanceof Error ? error.message : "保存限制失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <form className="quota-editor source-limit-editor" onSubmit={save}>
+      <div className="quota-heading">
+        <div><strong>单设备限制</strong><span>{link.sourceLimit.enabled ? `已绑定 ${link.sourceLimit.allowedIp}` : "当前不限来源"}</span></div>
+        <label className="switch-label"><input type="checkbox" checked={enabled} disabled={saving} onChange={(event) => setEnabled(event.target.checked)} /><span>限制来源</span></label>
+      </div>
+      {enabled ? (
+        <div className="quota-fields">
+          {choices.length ? <label><span>选用近 5 分钟来源</span><select value="" disabled={saving} onChange={(event) => setAllowedIp(event.target.value)}><option value="" disabled>选择 IP</option>{choices.map(({ ip }) => <option value={ip} key={ip}>{ip}</option>)}</select></label> : null}
+          <label><span>允许的公网 IP</span><input value={allowedIp} onChange={(event) => setAllowedIp(event.target.value)} placeholder="输入 IPv4 或 IPv6" spellCheck={false} autoCapitalize="off" maxLength={64} disabled={saving} required /></label>
+        </div>
+      ) : null}
+      <p className="quota-note">只允许一个来源 IP。同一公网 IP 下的设备无法区分；换网络后可在这里重新绑定。</p>
+      <div className="quota-actions">
+        <span role="status" className={failed ? "form-error" : "form-success"}>{message}</span>
+        <button type="submit" disabled={saving || !changed || (enabled && !allowedIp.trim())}>{saving ? "应用中…" : "保存限制"}</button>
+      </div>
+    </form>
   );
 }
 
@@ -599,7 +656,7 @@ function WebsiteActivity({ snapshot }: { snapshot: MonitorSnapshot }) {
         <span><b>{report?.summary.connections ?? 0}</b> 次连接</span>
         <span><b>{report?.summary.targets ?? 0}</b> 个目标</span>
         <span><b>{report?.summary.ips ?? 0}</b> 个来源 IP</span>
-        <span><b>{report?.summary.devices ?? 0}</b> 个已识别设备</span>
+        <span><b>{report?.summary.devices ?? 0}</b> 个已识别 UUID</span>
         <small>{report ? `记录保留 ${report.retentionDays} 天 · 最后访问 ${formatTime(report.summary.latest)}` : "正在读取访问记录"}</small>
       </div>
 
@@ -855,7 +912,7 @@ export default function Dashboard() {
         <div className="stats">
           <Stat label="上行" value={formatBytes(data?.totals.uplink ?? 0)} hint="客户端发往服务器" tone="up" />
           <Stat label="下行" value={formatBytes(data?.totals.downlink ?? 0)} hint="服务器发往客户端" tone="down" />
-          <Stat label="活跃 IP" value={String(activeIps)} hint="最近 5 分钟" />
+          <Stat label="活跃 IP" value={String(data?.activeSourceCount ?? activeIps)} hint="最近 5 分钟" />
           <Stat label="代理链接" value={String(links.length)} hint={`${links.filter((link) => link.ips.length > 0).length} 条已有记录`} />
         </div>
       </section>
@@ -875,7 +932,7 @@ export default function Dashboard() {
           </div>
           {creating && data ? <LinkEditor protocols={data.xrayManager.protocols} onSaved={setData} onCancel={() => setCreating(false)} /> : null}
           <div className="link-table-head" aria-hidden="true">
-            <span>链接</span><span>入口</span><span>总流量</span><span>相对用量</span><span>设备 / 来源</span>
+            <span>链接</span><span>入口</span><span>总流量</span><span>相对用量</span><span>近 5 分钟</span>
           </div>
           <div className="link-list">
             {links
@@ -903,6 +960,7 @@ export default function Dashboard() {
             {selectedLink ? <button type="button" onClick={() => setSelected("all")}>清除</button> : null}
           </div>
           {selectedLink ? <UuidDevices key={`uuid-${selectedLink.id}`} link={selectedLink} onSaved={setData} /> : null}
+          {selectedLink ? <SourceLimitEditor key={`source-limit-${selectedLink.id}`} link={selectedLink} onSaved={setData} /> : null}
           {selectedLink ? <QuotaEditor key={selectedLink.id} link={selectedLink} onSaved={setData} /> : null}
           {selectedLink ? <ExpiryEditor key={`expiry-${selectedLink.id}`} link={selectedLink} onSaved={setData} /> : null}
           {selectedLink?.managed ? (

@@ -111,6 +111,7 @@ def main():
     parser.add_argument("--api-port", type=int, default=47495)
     parser.add_argument("--access-log", default="/var/log/xray/access.log")
     parser.add_argument("--client-config-dir")
+    parser.add_argument("--trust-loopback-ws", action="store_true")
     args = parser.parse_args()
 
     with io.open(args.config, "r", encoding="utf-8") as handle:
@@ -122,6 +123,13 @@ def main():
                 payload = json.load(handle)
             changed = False
             for inbound in payload.get("inbounds", []):
+                stream = inbound.get("streamSettings", {})
+                if (args.trust_loopback_ws and inbound.get("listen") in ("127.0.0.1", "::1")
+                        and (stream.get("method") or stream.get("network")) in ("ws", "websocket")):
+                    sockopt = stream.setdefault("sockopt", {})
+                    if not sockopt.get("trustedXForwardedFor"):
+                        sockopt["trustedXForwardedFor"] = ["X-Forwarded-For"]
+                        changed = True
                 if inbound.get("protocol") not in ("vmess", "vless", "trojan"):
                     continue
                 for client in inbound.get("settings", {}).get("clients", []):

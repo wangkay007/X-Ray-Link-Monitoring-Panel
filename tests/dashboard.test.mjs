@@ -60,7 +60,7 @@ test("keeps multi-client UUID discovery and rendering enabled", async () => {
 
   assert.match(collector, /for client in inbound\.get\("settings", \{\}\)\.get\("clients", \[\]\)/);
   assert.match(dashboard, /devices\.map\(\(device\)/);
-  assert.match(dashboard, /展示此链接配置中的全部设备 UUID/);
+  assert.match(dashboard, /UUID 凭据/);
 });
 
 test("uses a configurable rolling server traffic period", async () => {
